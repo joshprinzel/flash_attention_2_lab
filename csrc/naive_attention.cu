@@ -10,24 +10,67 @@
 
 namespace {
 
-__global__ void naive_attention_zero_kernel(
+template <int HEAD_DIM>
+__global__ void naive_online_attention_kernel(
+    const float* query,
+    const float* key, 
+    const float* value,
     float* output,
     int64_t num_query_rows,
-    int64_t head_dimension
+    int64_t sequence_length,
+    float scale
 ) {
-    // One CUDA thread owns one complete query row.
-    const int64_t row =
-        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t query_row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
-    if (row >= num_query_rows) {
+    if(query_row >= num_query_rows){
         return;
     }
 
-    const int64_t output_row_offset = row * head_dimension;
+    const int64_t batch_head = query_row / sequence_length;
+    const int64_t query_offset = query_row * HEAD_DIM;
 
-    for (int64_t dimension = 0; dimension < head_dimension; ++dimension) {
-        output[output_row_offset + dimension] = 0.0f;
+    float row_max = -INFINITY;
+    float row_sum = 0.0f;
+
+    float output_accumulator[HEAD_DIM];
+
+    #pragma unroll
+    for(int dimension = 0; dimension < HEAD_DIM; ++dimension){
+        output_accumulator[dimension] = 0.0f;
     }
+
+    for(int64_t key_position = 0; key_position < sequence_length; key_position++){
+        const int64_t key_row = batch_head * sequence_length + key_position;
+        const int64_t key_offset = key_row * HEAD_DIM;
+        float score = 0.0f;
+
+        #pragma unroll
+        for(int dimension = 0; dimension < HEAD_DIM; dimension++){
+            score += query[query_offset + dimension] * key[key_offset + dimension];
+        }
+        score *= scale;
+
+        const float new_row_max = fmaxf(row_max, score);
+        const float previous_scale = expf(row_max - new_row_max);
+        const float current_scale = expf(score - new_row_max);
+
+        row_sum = previous_scale * row_sum + current_scale;
+
+        #pragma unroll
+        for(int dimension = 0; dimension < HEAD_DIM; dimension++){
+            output_accumulator[dimension] = previous_scale * output_accumulator[dimension] + current_scale * value[key_offset + dimension];
+        }
+        row_max = new_row_max;
+    }
+
+    const float inverse_row_sum = 1.0f / row_sum;
+
+    #pragma unroll
+    for(int dimension = 0; dimension < HEAD_DIM; dimension++){
+        output[query_offset + dimension] = output_accumulator[dimension] * inverse_row_sum;
+    }
+
+    
 }
 
 __global__ void naive_attention_scores_kernel(
@@ -128,6 +171,9 @@ torch::Tensor naive_attention_forward(
         return output;
     }
 
+    const float scale =
+    1.0f / std::sqrt(static_cast<float>(head_dimension));
+
     constexpr int threads_per_block = 128;
 
     const int blocks = static_cast<int>(
@@ -135,16 +181,48 @@ torch::Tensor naive_attention_forward(
         threads_per_block
     );
 
-    naive_attention_zero_kernel<<<
-        blocks,
-        threads_per_block,
-        0,
-        at::cuda::getCurrentCUDAStream()
-    >>>(
-        output.data_ptr<float>(),
-        num_query_rows,
-        head_dimension
-    );
+    switch (head_dimension) {
+        case 64:
+            naive_online_attention_kernel<64><<<
+                blocks,
+                threads_per_block,
+                0,
+                at::cuda::getCurrentCUDAStream()
+            >>>(
+                query.data_ptr<float>(),
+                key.data_ptr<float>(),
+                value.data_ptr<float>(),
+                output.data_ptr<float>(),
+                num_query_rows,
+                query_length,
+                scale
+            );
+            break;
+
+        case 128:
+            naive_online_attention_kernel<128><<<
+                blocks,
+                threads_per_block,
+                0,
+                at::cuda::getCurrentCUDAStream()
+            >>>(
+                query.data_ptr<float>(),
+                key.data_ptr<float>(),
+                value.data_ptr<float>(),
+                output.data_ptr<float>(),
+                num_query_rows,
+                query_length,
+                scale
+            );
+            break;
+
+        default:
+            TORCH_CHECK(
+                false,
+                "naive_attention_forward currently supports "
+                "head dimensions 64 and 128"
+            );
+    }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
