@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Compiled extensions and object files
+*.so
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.dylib
+
+# CUDA compilation
+*.cubin
+*.fatbin
+*.ptx
+
+# PyTorch extension cache
+.torch_extensions/
+
+# VS Code generated configuration
+.vscode/
+
+# Build systems
+.ninja_deps
+.ninja_log
+compile_commands.json
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+
+# Test and coverage output
+.coverage
+coverage.xml
+htmlcov/
+
+# Profiling output
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Benchmark output
+benchmark_results/
+results/
+
+# Logs
+*.log
+
+# Operating system files
+.DS_Store
+Thumbs.db
