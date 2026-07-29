@@ -13,6 +13,12 @@ torch::Tensor naive_attention_scores(
     torch::Tensor key
 );
 
+torch::Tensor block_attention_forward(
+    torch::Tensor query,
+    torch::Tensor key, 
+    torch::Tensor value
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
     module.def(
         "copy_cuda",
@@ -30,5 +36,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
         "naive_attention_scores",
         &naive_attention_scores,
         "Compute naive scaled attention scores"
+    );
+
+    module.def(
+        "block_attention_forward",
+        &block_attention_forward,
+        "Block-cooperative online attention"
     );
 }

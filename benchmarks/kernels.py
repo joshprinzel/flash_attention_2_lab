@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+import flash_attention_cuda
+
+from benchmarks.workloads import AttentionInputs, AttentionWorkload
+
+
+KernelFunction = Callable[
+    [AttentionInputs, AttentionWorkload],
+    Tensor,
+]
+
+
+@dataclass(frozen=True)
+class KernelSpec:
+    name: str
+    function: KernelFunction
+    supported: Callable[[AttentionWorkload], bool]
+
+
+def naive_online(
+    inputs: AttentionInputs,
+    workload: AttentionWorkload,
+) -> Tensor:
+    return flash_attention_cuda.naive_attention_forward(
+        inputs.query,
+        inputs.key,
+        inputs.value,
+    )
+
+def block_online(
+    inputs: AttentionInputs,
+    workload: AttentionWorkload,
+) -> Tensor:
+    return flash_attention_cuda.block_attention_forward(
+        inputs.query,
+        inputs.key,
+        inputs.value,
+    )
+
+def pytorch_sdpa(
+    inputs: AttentionInputs,
+    workload: AttentionWorkload,
+) -> Tensor:
+    return F.scaled_dot_product_attention(
+        inputs.query,
+        inputs.key,
+        inputs.value,
+        is_causal=workload.causal,
+    )
+
+
+KERNELS = [
+    KernelSpec(
+        name="naive_online",
+        function=naive_online,
+        supported=lambda workload: (
+            workload.dtype == torch.float32
+            and workload.query_length == workload.key_length
+            and workload.head_dimension in {64, 128}
+            and not workload.causal
+        ),
+    ),
+    KernelSpec(
+        name="pytorch_sdpa",
+        function=pytorch_sdpa,
+        supported=lambda workload: True,
+    ),
+    KernelSpec(
+        name="block_online",
+        function=block_online,
+        supported=lambda workload: (
+            workload.dtype == torch.float32
+            and workload.query_length == workload.key_length
+            and workload.head_dimension in {64, 128}
+            and not workload.causal
+        ),
+    ),
+]
