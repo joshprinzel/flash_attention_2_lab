@@ -10,6 +10,7 @@ setup(
             sources=[
                 "csrc/bindings.cpp",
                 "csrc/copy_kernel.cu",
+                "csrc/naive_attention.cu",
             ],
             extra_compile_args={
                 "cxx": [
