@@ -45,6 +45,26 @@ def block_online(
         inputs.value,
     )
 
+def tiled_simt(
+        inputs: AttentionInputs,
+        workload: AttentionWorkload
+) -> Tensor:
+    return flash_attention_cuda.tiled_attention_forward(
+        inputs.query,
+        inputs.key,
+        inputs.value,
+    )
+
+def tilewise_simt(
+        inputs: AttentionInputs,
+        workload: AttentionWorkload
+) -> Tensor:
+    return flash_attention_cuda.tilewise_attention_forward(
+        inputs.query,
+        inputs.key,
+        inputs.value
+    )
+
 def pytorch_sdpa(
     inputs: AttentionInputs,
     workload: AttentionWorkload,
@@ -80,6 +100,27 @@ KERNELS = [
             workload.dtype == torch.float32
             and workload.query_length == workload.key_length
             and workload.head_dimension in {64, 128}
+            and not workload.causal
+        ),
+    ),
+    KernelSpec(
+        name="tiled_simt",
+        function=tiled_simt,
+        supported=lambda workload: (
+            workload.dtype == torch.float32
+            and workload.query_length == workload.key_length
+            and workload.head_dimension == 64
+            and not workload.causal
+        ),
+    ),
+
+    KernelSpec(
+        name="tilewise_simt",
+        function=tiled_simt,
+        supported=lambda workload: (
+            workload.dtype == torch.float32
+            and workload.query_length == workload.key_length
+            and workload.head_dimension == 64
             and not workload.causal
         ),
     ),

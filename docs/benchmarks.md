@@ -94,3 +94,89 @@ Future benchmark entries should record:
 * causal or non-causal mode;
 * input dtype;
 * warmup, sample, and iteration counts.
+
+
+
+
+## Experiment 1: Block-Per-Query-Row Decomposition
+
+### Hypothesis
+
+The serial online-softmax baseline assigns one CUDA thread to each query row. That thread computes all query-key dot products and retains the entire output vector in thread-local state.
+
+The first optimization changed ownership to:
+
+```text
+One CUDA block owns one query row
+One thread owns one output dimension
+Threads cooperate on each query-key dot product
+```
+
+The expected benefits were:
+
+* lower per-thread accumulator demand;
+* more parallelism across the head dimension;
+* reduced register pressure for head dimensions 64 and 128;
+* warp-shuffle reductions for query-key dot products.
+
+### Results
+
+| Sequence length | Head dimension | Serial online | Block online | Block vs. serial | Block vs. SDPA |
+| --------------: | -------------: | ------------: | -----------: | ---------------: | -------------: |
+|             128 |             64 |     0.1543 ms |    0.1662 ms |     1.08× slower |          6.39× |
+|             512 |             64 |     0.5662 ms |    1.9062 ms |     3.37× slower |         16.72× |
+|            1024 |             64 |     1.1454 ms |    7.2672 ms |     6.35× slower |         17.16× |
+|             512 |            128 |     1.8302 ms |    3.4058 ms |     1.86× slower |         17.42× |
+
+### Interpretation
+
+The block-per-query-row decomposition exposed more threads but did not improve the underlying memory-reuse pattern. Every query row continued to load the complete key and value matrices independently.
+
+For every key position, the kernel performed:
+
+1. A cooperative dot-product reduction.
+2. A block-wide synchronization after partial reductions.
+3. A scalar online-softmax update by thread zero.
+4. A block-wide synchronization before output accumulation.
+5. A per-thread output update.
+6. A block-wide synchronization before processing the next key.
+
+This introduced approximately three block-wide barriers per key position. The synchronization cost increased linearly with sequence length:
+
+| Sequence length | Approximate barriers per query row |
+| --------------: | ---------------------------------: |
+|             128 |                                384 |
+|             512 |                              1,536 |
+|            1024 |                              3,072 |
+
+The kernel introduced synchronization overhead without creating reuse of K or V across multiple query rows. This explains why the regression became substantially larger as sequence length increased.
+
+### Decision
+
+The block-per-query-row design is rejected as an optimization path. It remains in the benchmark suite as a documented negative result.
+
+The next implementation uses a tiled decomposition:
+
+```text
+One block owns multiple query rows
+K and V tiles are loaded once into shared memory
+All query rows in the block reuse each K/V tile
+Dot-product reductions remain warp-local
+Online-softmax state remains register-resident
+```
+
+Initial specialization:
+
+| Parameter                |   Value |
+| ------------------------ | ------: |
+| Query tile, `Br`         | 16 rows |
+| Key/value tile, `Bc`     | 32 rows |
+| Head dimension           |      64 |
+| Threads per block        |     128 |
+| Warps per block          |       4 |
+| Query rows per warp      |       4 |
+| Shared K storage         |    8 KB |
+| Shared V storage         |    8 KB |
+| Total K/V shared storage |   16 KB |
+
+This decomposition is the first implementation expected to obtain the defining IO-reuse advantage of FlashAttention.

@@ -11,6 +11,8 @@ setup(
                 "csrc/bindings.cpp",
                 "csrc/copy_kernel.cu",
                 "csrc/naive_attention.cu",
+                "csrc/tiled_attention.cu",
+                "csrc/tilewise_attention.cu",
             ],
             extra_compile_args={
                 "cxx": [
@@ -22,6 +24,7 @@ setup(
                     "-std=c++17",
                     "--use_fast_math",
                     "-lineinfo",
+                    #"-Xptxas=-v"
                 ],
             },
         )

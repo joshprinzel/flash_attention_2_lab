@@ -19,6 +19,18 @@ torch::Tensor block_attention_forward(
     torch::Tensor value
 );
 
+torch::Tensor tiled_attention_forward(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value
+);
+
+torch::Tensor tilewise_attention_forward(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
     module.def(
         "copy_cuda",
@@ -42,5 +54,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
         "block_attention_forward",
         &block_attention_forward,
         "Block-cooperative online attention"
+    );
+
+    module.def(
+        "tiled_attention_forward",
+        &tiled_attention_forward,
+        "Tiled SIMT online attention forward pass"
+    );
+
+    module.def(
+        "tilewise_attention_forward",
+        &tilewise_attention_forward,
+        "Tilewise SIMT attention forward pass"
     );
 }
