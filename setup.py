@@ -13,6 +13,7 @@ setup(
                 "csrc/naive_attention.cu",
                 "csrc/tiled_attention.cu",
                 "csrc/tilewise_attention.cu",
+                "csrc/wmma_matmul.cu",
             ],
             extra_compile_args={
                 "cxx": [

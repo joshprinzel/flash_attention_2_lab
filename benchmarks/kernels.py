@@ -116,7 +116,7 @@ KERNELS = [
 
     KernelSpec(
         name="tilewise_simt",
-        function=tiled_simt,
+        function=tilewise_simt,
         supported=lambda workload: (
             workload.dtype == torch.float32
             and workload.query_length == workload.key_length

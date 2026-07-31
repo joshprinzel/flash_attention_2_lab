@@ -31,6 +31,11 @@ torch::Tensor tilewise_attention_forward(
     torch::Tensor value
 );
 
+torch::Tensor wmma_matmul_16x64x16(
+    torch::Tensor matrix_a,
+    torch::Tensor matrix_b
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
     module.def(
         "copy_cuda",
@@ -66,5 +71,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
         "tilewise_attention_forward",
         &tilewise_attention_forward,
         "Tilewise SIMT attention forward pass"
+    );
+
+    module.def(
+        "wmma_matmul_16x64x16",
+        &wmma_matmul_16x64x16,
+        "WMMA FP16 16x64 by 64x16 matrix multiplication with FP32 accumulation"
     );
 }
