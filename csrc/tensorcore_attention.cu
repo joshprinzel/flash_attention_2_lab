@@ -6,6 +6,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <mma.h>
 
 #include <cmath>
@@ -35,8 +36,154 @@ constexpr int kQueryTileSize =
 
 constexpr unsigned int kFullWarpMask = 0xffffffffu;
 
+struct MmaOperandA {
+    uint32_t registers[4];
+};
+struct MmaOperandB {
+    uint32_t registers[2];
+};
+struct MmaAccumulator{
+    float registers[4];
+};
 
-template <int kKeyTileSize>
+__device__ __forceinline__ uint32_t shared_address(const void* pointer){
+    return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
+}
+
+__device__ __forceinline__ MmaOperandA load_mma_a_row_major(
+    const half* matrix,
+    int leading_dimension
+){
+    const int lane_id = static_cast<int>(threadIdx.x) & 31;
+
+    /*
+    ldmatrix.x4 treats the 16x16 matrix as four
+    row-major 8x8 matrices:
+
+    matrix 0: rows 0-7, columns 0-7
+    matrix 1: rows 0-7, columns 8-15
+    matrix 2: rows 8-15, columns 0-7
+    matrix 3: rows 8-15, columns 8-15
+
+    Lanes 0-7 provied row addresses for matrix 0,
+    lanes 8-15 for matrix 1, and so on.
+    */
+
+    const int matrix_index = lane_id >> 3;
+    const int row_within_matrix = lane_id & 7;
+    const int matrix_row_offset = (matrix_index & 1) * 8;
+    const int matrix_column_offset = (matrix_index >> 1) * 8;
+
+    const half* row_pointer = matrix + (
+        matrix_row_offset + row_within_matrix
+    ) * leading_dimension + matrix_column_offset;
+
+    const uint32_t address = shared_address(row_pointer);
+
+    MmaOperandA fragment;
+
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+        "{%0, %1, %2, %3}, [%4];\n"
+        : "=r"(fragment.registers[0]),
+          "=r"(fragment.registers[1]),
+          "=r"(fragment.registers[2]),
+          "=r"(fragment.registers[3])
+        : "r"(address)
+    );
+    return fragment;
+}
+
+__device__ __forceinline__ MmaOperandB load_mma_b_col_major_from_row_major(
+    const half* matrix,
+    int leading_dimension
+){
+    const int lane_id = static_cast<int>(threadIdx.x) & 31;
+
+    /*
+    x2 loads two 8x8 matrices:
+
+    matrix 0: row 0-7, columns 0-7
+    matrix 1: rows 8-15, columns 0-7
+    */
+
+    const int address_lane = lane_id & 15;
+    const int matrix_index = address_lane >> 3;
+    const int row_within_matrix = address_lane & 7;
+    const int row = matrix_index * 8 + row_within_matrix;
+    const half* row_pointer = matrix + row * leading_dimension;
+    const uint32_t address = shared_address(row_pointer);
+
+    MmaOperandB fragment;
+
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+        "{%0, %1}, [%2];\n"
+        : "=r"(fragment.registers[0]),
+          "=r"(fragment.registers[1])
+        : "r"(address)
+    );
+    return fragment;
+}
+
+__device__ __forceinline__
+void mma_m16n8k16_f16_f32(
+    MmaAccumulator& accumulator,
+    const MmaOperandA& matrix_a,
+    const MmaOperandB& matrix_b
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col."
+        "f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%0, %1, %2, %3};\n"
+        : "+f"(accumulator.registers[0]),
+          "+f"(accumulator.registers[1]),
+          "+f"(accumulator.registers[2]),
+          "+f"(accumulator.registers[3])
+        : "r"(matrix_a.registers[0]),
+          "r"(matrix_a.registers[1]),
+          "r"(matrix_a.registers[2]),
+          "r"(matrix_a.registers[3]),
+          "r"(matrix_b.registers[0]),
+          "r"(matrix_b.registers[1])
+    );
+}
+
+__device__ __forceinline__ 
+MmaAccumulator zero_mma_accumulator(){
+    MmaAccumulator accumulator;
+
+    #pragma unroll
+    for(int index = 0; index < 4; ++index){
+        accumulator.registers[index] = 0.0f;
+    }
+    return accumulator;
+}
+
+__device__ __forceinline__
+int mma_accumulator_row(
+    int lane_id,
+    int register_index
+){
+    const int group_id = lane_id >> 2;
+
+    return register_index < 2 ? group_id : group_id + 8;
+}
+
+__device__ __forceinline__
+int mma_accumulator_column(
+    int lane_id,
+    int register_index
+){
+    const int thread_in_group = lane_id & 3;
+    return thread_in_group * 2 + (register_index & 1);
+}
+
+
+template <int kKeyTileSize, bool kUseRawPv = false>
 __global__ void tensorcore_attention_forward_kernel_d64(
     const half* __restrict__ query,
     const half* __restrict__ key,
@@ -59,6 +206,11 @@ __global__ void tensorcore_attention_forward_kernel_d64(
     static_assert(
         kQueryTileSize ==
             kWarpsPerBlock * kQueryRowsPerWarp
+    );
+
+    static_assert(
+        !kUseRawPv || kKeyTileSize == 32,
+        "The raw PV experiment requires Bc=32"
     );
 
     const int thread_id =
@@ -132,13 +284,22 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         kKeyTileSize
     ];
 
+    /*
+    The raw-PV specialization does not matrielize PV
+    A one-element placeholder keeps the declaration valid
+    while avoiding the 16 KiB allocation.
+    */
+
+    constexpr int kPvSharedWarps = kUseRawPv ? 1 : kWarpsPerBlock;
+    constexpr int kPvSharedRows = kUseRawPv ? 1 : kQueryRowsPerWarp;
+    constexpr int kPvSharedColumns = kUseRawPv ? 1 : kHeadDimension;
     __shared__ __align__(32)
     float pv_shared[
-        kWarpsPerBlock
+        kPvSharedWarps
     ][
-        kQueryRowsPerWarp
+        kPvSharedRows
     ][
-        kHeadDimension
+        kPvSharedColumns
     ];
 
     __shared__ __align__(32)
@@ -539,11 +700,135 @@ __global__ void tensorcore_attention_forward_kernel_d64(
          *   the same FP32 fragment.
          */
 
-#pragma unroll
+         if constexpr (kUseRawPv) {
+        constexpr int kRawMmaOutputColumns = 8;
+
+        constexpr int kRawOutputSubtiles =
+            kHeadDimension /
+            kRawMmaOutputColumns;
+
+        /*
+        * Raw PV path:
+        *
+        * P [16, 32] x V [32, 64]
+        *
+        * Each mma.m16n8k16 instruction produces a
+        * [16, 8] output tile. Eight output subtiles cover
+        * the complete 64-dimensional output.
+        */
+    #pragma unroll
+        for (
+            int output_subtile = 0;
+            output_subtile < kRawOutputSubtiles;
+            ++output_subtile
+        ) {
+            const int output_dimension_offset =
+                output_subtile *
+                kRawMmaOutputColumns;
+
+            MmaAccumulator pv_accumulator =
+                zero_mma_accumulator();
+
+            /*
+            * Bc=32 requires two K=16 MMA reduction steps:
+            *
+            * P[:,  0:16] x V[ 0:16, :]
+            * P[:, 16:32] x V[16:32, :]
+            */
+    #pragma unroll
+            for (
+                int reduction_offset = 0;
+                reduction_offset < kKeyTileSize;
+                reduction_offset += kMmaK
+            ) {
+                const half* probability_tile =
+                    &probability_shared[
+                        warp_id
+                    ][
+                        0
+                    ][
+                        reduction_offset
+                    ];
+
+                const half* value_tile =
+                    &value_shared[
+                        reduction_offset
+                    ][
+                        output_dimension_offset
+                    ];
+
+                const MmaOperandA probability_fragment =
+                    load_mma_a_row_major(
+                        probability_tile,
+                        kKeyTileSize
+                    );
+
+                const MmaOperandB value_fragment =
+                    load_mma_b_col_major_from_row_major(
+                        value_tile,
+                        kHeadDimension
+                    );
+
+                mma_m16n8k16_f16_f32(
+                    pv_accumulator,
+                    probability_fragment,
+                    value_fragment
+                );
+            }
+
+            /*
+            * Preserve raw-MMA accumulator ownership.
+            *
+            * Each lane owns four values from each [16,8]
+            * output subtile. Across eight subtiles:
+            *
+            * 8 subtiles x 4 values = 32 FP32 values/lane.
+            */
+    #pragma unroll
+            for (
+                int register_index = 0;
+                register_index < 4;
+                ++register_index
+            ) {
+                const int local_row =
+                    mma_accumulator_row(
+                        lane_id,
+                        register_index
+                    );
+
+                const int accumulator_index =
+                    output_subtile * 4 +
+                    register_index;
+
+                const float previous_scale =
+                    previous_scale_shared[
+                        warp_id
+                    ][
+                        local_row
+                    ];
+
+                output_accumulator[
+                    accumulator_index
+                ] =
+                    previous_scale *
+                        output_accumulator[
+                            accumulator_index
+                        ] +
+                    pv_accumulator.registers[
+                        register_index
+                    ];
+            }
+        }
+    } else {
+        /*
+        * Existing WMMA PV path.
+        *
+        * Each output fragment covers 16 output dimensions.
+        */
+    #pragma unroll
         for (
             int output_dimension_offset = 0;
-            output_dimension_offset <
-                kHeadDimension;
+            output_dimension_offset < kHeadDimension;
             output_dimension_offset += kMmaN
         ) {
             wmma::fragment<
@@ -559,7 +844,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                 0.0f
             );
 
-#pragma unroll
+    #pragma unroll
             for (
                 int reduction_offset = 0;
                 reduction_offset < kKeyTileSize;
@@ -599,18 +884,12 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                         output_dimension_offset
                     ];
 
-                /*
-                 * P is physically [16, Bc].
-                 */
                 wmma::load_matrix_sync(
                     probability_fragment,
                     probability_tile,
                     kKeyTileSize
                 );
 
-                /*
-                 * V is physically [Bc, 64].
-                 */
                 wmma::load_matrix_sync(
                     value_fragment,
                     value_tile,
@@ -640,21 +919,16 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         }
 
         /*
-         * PV storage is warp-private.
-         */
-
+        * Only the WMMA path stores PV into shared memory.
+        * Synchronize before reading that data back.
+        */
         __syncwarp(kFullWarpMask);
 
-
         /*
-         * Merge this tile's PV contribution into the
-         * persistent FP32 online-softmax numerator.
-         *
-         * Each lane owns 32 elements from the warp's
-         * 16x64 output tile.
-         */
-
-#pragma unroll
+        * Merge the materialized WMMA PV result into the
+        * persistent online-softmax numerator.
+        */
+    #pragma unroll
         for (int item = 0; item < 32; ++item) {
             const int linear_index =
                 lane_id +
@@ -686,15 +960,14 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                     dimension
                 ];
         }
-
-        /*
-         * All warps must finish consuming K, V, and
-         * warp-private temporary storage before any
-         * thread overwrites the shared K/V tile.
-         */
-
-        __syncthreads();
     }
+
+    /*
+    * All warps must finish consuming the current K/V tile
+    * before any thread overwrites shared K and V storage.
+    */
+    __syncthreads();
+}
 
 
     /*
@@ -717,47 +990,78 @@ __global__ void tensorcore_attention_forward_kernel_d64(
      * the final FP16 output.
      */
 
-#pragma unroll
-    for (int item = 0; item < 32; ++item) {
-        const int linear_index =
-            lane_id +
-            item * kWarpSize;
+     if constexpr(kUseRawPv){
+        constexpr int kRawMmaOutputColumns = 8; 
+        constexpr int kRawOutputSubtiles = kHeadDimension / kRawMmaOutputColumns;
 
-        const int local_row =
-            linear_index /
-            kHeadDimension;
+        #pragma unroll
+        for(int output_subtiles = 0; output_subtiles < kRawOutputSubtiles; output_subtiles++){
+            #pragma unroll
+            for(int register_index = 0; register_index < 4; register_index++){
+                const int local_row = mma_accumulator_row(lane_id, register_index);
+                const int dimension = output_subtiles * kRawMmaOutputColumns + 
+                mma_accumulator_column(lane_id, register_index);
 
-        const int dimension =
-            linear_index %
-            kHeadDimension;
+                const int accumulator_index = output_subtiles * 4 + register_index;
+                const int64_t global_query_row = query_tile_start + warp_id * kQueryRowsPerWarp + local_row;
 
-        const int64_t global_query_row =
-            query_tile_start +
-            warp_id *
-                kQueryRowsPerWarp +
-            local_row;
+                if(global_query_row < sequence_length){
+                    const float normalized_output = output_accumulator[accumulator_index] *
+                    inverse_sum_shared[warp_id][local_row];
 
-        if (global_query_row < sequence_length) {
-            const float normalized_output =
-                output_accumulator[item] *
-                inverse_sum_shared[
-                    warp_id
-                ][
-                    local_row
-                ];
+                    const int64_t global_index = tensor_base + global_query_row * kHeadDimension + dimension;
 
-            const int64_t global_index =
-                tensor_base +
-                global_query_row *
-                    kHeadDimension +
-                dimension;
-
-            output[global_index] =
-                __float2half_rn(
-                    normalized_output
-                );
+                    output[global_index] = __float2half_rn(normalized_output);
+                }
+            }
         }
-    }
+
+
+     }else{
+        #pragma unroll
+        for (int item = 0; item < 32; ++item) {
+            const int linear_index =
+                lane_id +
+                item * kWarpSize;
+
+            const int local_row =
+                linear_index /
+                kHeadDimension;
+
+            const int dimension =
+                linear_index %
+                kHeadDimension;
+
+            const int64_t global_query_row =
+                query_tile_start +
+                warp_id *
+                    kQueryRowsPerWarp +
+                local_row;
+
+            if (global_query_row < sequence_length) {
+                const float normalized_output =
+                    output_accumulator[item] *
+                    inverse_sum_shared[
+                        warp_id
+                    ][
+                        local_row
+                    ];
+
+                const int64_t global_index =
+                    tensor_base +
+                    global_query_row *
+                        kHeadDimension +
+                    dimension;
+
+                output[global_index] =
+                    __float2half_rn(
+                        normalized_output
+                    );
+            }
+        }
+     }
+
+
 }
 
 
@@ -856,7 +1160,7 @@ void validate_tensorcore_attention_inputs(
 }
 
 
-template <int kKeyTileSize>
+template <int kKeyTileSize, bool kUseRawPv = false>
 torch::Tensor tensorcore_attention_forward_impl(
     torch::Tensor query,
     torch::Tensor key,
@@ -970,7 +1274,7 @@ torch::Tensor tensorcore_attention_forward_impl(
         );
 
     tensorcore_attention_forward_kernel_d64<
-        kKeyTileSize
+        kKeyTileSize, kUseRawPv
     ><<<
         grid,
         block,
@@ -1018,6 +1322,22 @@ torch::Tensor tensorcore_attention_forward_bc32(
     torch::Tensor value
 ) {
     return tensorcore_attention_forward_impl<32>(
+        query,
+        key,
+        value
+    );
+}
+
+
+torch::Tensor tensorcore_attention_forward_bc32_raw_pv(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value
+) {
+    return tensorcore_attention_forward_impl<
+        32,
+        true
+    >(
         query,
         key,
         value

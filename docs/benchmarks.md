@@ -596,3 +596,41 @@ The change should approximately halve:
 * loop-control overhead.
 
 The estimated shared-memory requirement is approximately 45,568 bytes per block, remaining below the static shared-memory limit and preserving the current expected block residency.
+
+
+
+## Experiment: Shared-Memory Bottleneck Diagnosis — Tensor Core FlashAttention (Bc=16/32, D=64)
+
+**Date:** 2026-08-03
+**Kernel:** `tensorcore_attention_forward_kernel_d64`, sm_89 (RTX 4070)
+**Config:** Br=64, D=64, WMMA 16×16×16, 4 warps/block, Bc∈{16,32}
+
+### Hypothesis going in
+Suspected the kernel would be compute-bound (tensor core MMA-limited) or possibly DRAM-bound given the O(N²) attention memory access pattern.
+
+### Method
+Profiled with `ncu` on the Bc=32 variant, full SOL + memory workload + warp state + occupancy sections.
+
+### Key results
+
+| Metric | Value | Interpretation |
+|---|---|---|
+| DRAM Throughput | 3.07% | Global bandwidth is a non-issue |
+| L2 Hit Rate | 78.26% | Working set fits in cache |
+| L1/TEX Cache Throughput | 83.39% | **Saturated** — shared mem + global loads share this pipe on sm_89 |
+| Compute (SM) Throughput | 21.53% | Tensor cores are idle most of the time |
+| Short-scoreboard stalls | 43% of 11.58 cycles/instr | Dominant stall reason — `ncu` attributes this directly to shared memory ops |
+| Block Limit Shared Mem | 2 blocks/SM | Binding occupancy constraint (vs. 4 for registers, 12 for warps) |
+| Theoretical Occupancy | 16.67% | |
+| Achieved Occupancy | 16.45% | Tracks theoretical almost exactly — no scheduling/tail loss on top |
+
+### Conclusion
+**The kernel is shared-memory/L1-pipe bound, not compute-bound and not DRAM-bound.** Two independent lines of evidence converge on the same root cause:
+
+1. **Occupancy** — static shared memory usage (~44KB for Bc=32: query 8KB + key 4KB + value 4KB + score 8KB + probability 4KB + pv 16KB) caps concurrent blocks at 2/SM, well below what registers or warp slots would allow.
+2. **Stall cycles** — the WMMA API forces a store→shared→load round trip at every fragment boundary (`score_shared → probability_shared → pv_shared → output_accumulator`), since fragment-to-thread mapping is opaque under `wmma::`. Combined with the serial, half-warp-utilized online-softmax reduction (lanes 0–15 only, columns looped one at a time), this generates enough LDS/STS traffic to saturate the L1 pipe independent of any actual data movement need.
+
+These aren't two separate problems — they're the same buffers (`pv_shared` being the largest single offender at 16KB) driving both the occupancy ceiling and the stall-cycle count. Shrinking shared memory footprint should yield a compounding win rather than an additive one.
+
+### Next experiment
+Rewrite PV accumulation and softmax reduction using raw `mma.sync.aligned.m16n8k16` PTX to get explicit thread-to-register fragment mapping, eliminating the `pv_shared` round trip entirely and replacing the serial softmax loop with warp-shuffle reduction across all 32 lanes. Target: raise `Block Limit Shared Mem` above 2, reduce short-scoreboard stall fraction below current 43%, re-profile and compare Compute/Memory SOL balance.

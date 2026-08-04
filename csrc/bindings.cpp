@@ -45,8 +45,15 @@ torch::Tensor tensorcore_attention_forward(
 torch::Tensor tensorcore_attention_forward_bc32(
     torch::Tensor query,
     torch::Tensor key,
-    torch::Tensor value,
+    torch::Tensor value
 );
+
+torch::Tensor tensorcore_attention_forward_bc32_raw_pv(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
     module.def(
         "copy_cuda",
@@ -100,5 +107,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
         "tensorcore_attention_forward_bc32",
         &tensorcore_attention_forward_bc32,
         "Fused FP16 Tensor core attention forward with Bc=32"
+    );
+
+    module.def(
+        "tensorcore_attention_forward_bc32_raw_pv",
+        &tensorcore_attention_forward_bc32_raw_pv,
+        "Fused FP16 Tensor Core attention with raw MMA PV"
     );
 }
