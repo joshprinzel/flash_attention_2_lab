@@ -64,6 +64,25 @@ def tilewise_simt(
         inputs.key,
         inputs.value
     )
+def tensorcore_attention(
+        inputs: AttentionInputs,
+        workload: AttentionWorkload
+) -> Tensor:
+    return flash_attention_cuda.tensorcore_attention_forward(
+        inputs.query,
+        inputs.key,
+        inputs.value
+    )
+
+def tensorcore_attention_bc32(
+        inputs: AttentionInputs,
+        workload: AttentionWorkload
+) -> Tensor:
+    return flash_attention_cuda.tensorcore_attention_forward_bc32(
+        inputs.query,
+        inputs.key,
+        inputs.value
+    )
 
 def pytorch_sdpa(
     inputs: AttentionInputs,
@@ -121,6 +140,30 @@ KERNELS = [
             workload.dtype == torch.float32
             and workload.query_length == workload.key_length
             and workload.head_dimension == 64
+            and not workload.causal
+        ),
+    ),
+
+    KernelSpec(
+        name="tensorcore_attention",
+        function=tensorcore_attention,
+        supported=lambda workload: (
+            workload.dtype == torch.float16
+            and workload.query_length == workload.key_length
+            and workload.head_dimension == 64
+            and workload.query_length % 16 == 0
+            and not workload.causal
+        ),
+    ),
+    KernelSpec(
+        name="tensorcore_attention_bc32",
+        function=tensorcore_attention_bc32,
+        supported=lambda workload: (
+            workload.dtype == torch.float16
+            and workload.query_length
+                == workload.key_length
+            and workload.head_dimension == 64
+            and workload.query_length % 32 == 0
             and not workload.causal
         ),
     ),

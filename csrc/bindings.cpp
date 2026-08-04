@@ -36,6 +36,17 @@ torch::Tensor wmma_matmul_16x64x16(
     torch::Tensor matrix_b
 );
 
+torch::Tensor tensorcore_attention_forward(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value
+);
+
+torch::Tensor tensorcore_attention_forward_bc32(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+);
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
     module.def(
         "copy_cuda",
@@ -77,5 +88,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
         "wmma_matmul_16x64x16",
         &wmma_matmul_16x64x16,
         "WMMA FP16 16x64 by 64x16 matrix multiplication with FP32 accumulation"
+    );
+
+    module.def(
+        "tensorcore_attention_forward",
+        &tensorcore_attention_forward,
+        "Fused FP16 Tensor Core attention forward pass"
+    );
+
+    module.def(
+        "tensorcore_attention_forward_bc32",
+        &tensorcore_attention_forward_bc32,
+        "Fused FP16 Tensor core attention forward with Bc=32"
     );
 }

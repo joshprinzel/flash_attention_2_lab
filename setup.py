@@ -14,6 +14,7 @@ setup(
                 "csrc/tiled_attention.cu",
                 "csrc/tilewise_attention.cu",
                 "csrc/wmma_matmul.cu",
+                "csrc/tensorcore_attention.cu"
             ],
             extra_compile_args={
                 "cxx": [
@@ -25,7 +26,7 @@ setup(
                     "-std=c++17",
                     "--use_fast_math",
                     "-lineinfo",
-                    #"-Xptxas=-v"
+                    "-Xptxas=-v"
                 ],
             },
         )

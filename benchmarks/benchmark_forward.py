@@ -14,6 +14,11 @@ from benchmarks.workloads import (
     generate_attention_inputs,
 )
 
+DTYPES: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16
+}
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -24,6 +29,7 @@ def main() -> None:
     parser.add_argument("--key-length", type=int, default=None)
     parser.add_argument("--head-dim", type=int, default=64)
     parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--dtype", type=str, choices=list(DTYPES), default="float32")
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=25)
@@ -42,7 +48,7 @@ def main() -> None:
         query_length=args.query_length,
         key_length=key_length,
         head_dimension=args.head_dim,
-        dtype=torch.float32,
+        dtype=DTYPES[args.dtype],
         causal=args.causal,
     )
 
