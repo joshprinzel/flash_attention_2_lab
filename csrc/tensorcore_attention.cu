@@ -126,6 +126,32 @@ __device__ __forceinline__ MmaOperandB load_mma_b_col_major_from_row_major(
     return fragment;
 }
 
+__device__ __forceinline__ MmaOperandB load_mma_b_k_transpose_from_row_major(
+    const half* matrix,
+    int leading_dimension
+){
+    const int lane_id = static_cast<int>(threadIdx.x) & 31;
+
+    const int address_lane = lane_id & 15;
+    const int matrix_index = address_lane >> 3;
+    const int row_within_matrix = address_lane & 7;
+
+    const int column_offset = matrix_index * 8;
+    const half* row_pointer = matrix + row_within_matrix * leading_dimension + column_offset;
+    const uint32_t address = shared_address(row_pointer);
+
+    MmaOperandB fragment;
+
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+        "{%0, %1}, [%2];\n"
+        : "=r"(fragment.registers[0]),
+        "=r"(fragment.registers[1])
+        : "r"(address)
+    );
+    return fragment;
+}
+
 __device__ __forceinline__
 void mma_m16n8k16_f16_f32(
     MmaAccumulator& accumulator,
@@ -183,7 +209,7 @@ int mma_accumulator_column(
 }
 
 
-template <int kKeyTileSize, bool kUseRawPv = false>
+template <int kKeyTileSize, bool kUseRawPv = false, bool kUseRawQk = false>
 __global__ void tensorcore_attention_forward_kernel_d64(
     const half* __restrict__ query,
     const half* __restrict__ key,
@@ -211,6 +237,16 @@ __global__ void tensorcore_attention_forward_kernel_d64(
     static_assert(
         !kUseRawPv || kKeyTileSize == 32,
         "The raw PV experiment requires Bc=32"
+    );
+
+    static_assert(
+        !kUseRawQk || kKeyTileSize == 32,
+        "The raw QK experiment requires Bc=32"
+    );
+
+    static_assert(
+        !kUseRawQk || kUseRawPv,
+        "The raw Qk experiment requires the raw PV path"
     );
 
     const int thread_id =
@@ -266,13 +302,17 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         kHeadDimension
     ];
 
+    constexpr int kScoreSharedWarps = kUseRawQk ? 1 : kWarpsPerBlock;
+    constexpr int kScoreSharedRows = kUseRawQk ? 1 : kQueryRowsPerWarp;
+    constexpr int kScoreSharedColumns = kUseRawQk ? 1 : kKeyTileSize;
+
     __shared__ __align__(32)
     float score_shared[
-        kWarpsPerBlock
+        kScoreSharedWarps
     ][
-        kQueryRowsPerWarp
+        kScoreSharedRows
     ][
-        kKeyTileSize
+        kScoreSharedColumns
     ];
 
     __shared__ __align__(32)
@@ -454,129 +494,279 @@ __global__ void tensorcore_attention_forward_kernel_d64(
          * score tiles.
          */
 
-#pragma unroll
-        for (
-            int key_subtile_offset = 0;
-            key_subtile_offset < kKeyTileSize;
-            key_subtile_offset += kMmaN
-        ) {
-            wmma::fragment<
-                wmma::matrix_a,
-                kMmaM,
-                kMmaN,
-                kMmaK,
-                half,
-                wmma::row_major
-            > query_fragment;
+         if constexpr (kUseRawQk){
+            constexpr int kRawMmaOutputColumns = 8;
 
-            /*
-             * K is physically stored as [Bc, 64]
-             * row-major.
-             *
-             * Loading it as a column-major matrix with
-             * leading dimension 64 reinterprets it as
-             * the required logical K^T tile [64,16].
-             */
-            wmma::fragment<
-                wmma::matrix_b,
-                kMmaM,
-                kMmaN,
-                kMmaK,
-                half,
-                wmma::col_major
-            > key_fragment;
+            constexpr int kRawScoresSubtiles = kKeyTileSize / kRawMmaOutputColumns;
 
-            wmma::fragment<
-                wmma::accumulator,
-                kMmaM,
-                kMmaN,
-                kMmaK,
-                float
-            > score_fragment;
+            MmaAccumulator score_accumulators[kRawScoresSubtiles];
+            #pragma unroll
+            for(int score_subtile = 0; score_subtile < kRawScoresSubtiles; ++score_subtile){
+                score_accumulators[score_subtile] = zero_mma_accumulator();
+            }
 
-            wmma::fill_fragment(
-                score_fragment,
-                0.0f
-            );
+            #pragma unroll
+            for(int dimension_offset = 0; dimension_offset < kHeadDimension; dimension_offset += kMmaK){
+                const half* query_tile = &query_shared[warp_id * kQueryRowsPerWarp][dimension_offset];
 
-#pragma unroll
+                const MmaOperandA query_fragment = load_mma_a_row_major(query_tile, kHeadDimension);
+
+                #pragma unroll
+                for(int score_subtile = 0; score_subtile < kRawScoresSubtiles; ++score_subtile){
+                    const int key_offset = score_subtile * kRawMmaOutputColumns;
+                    const half* key_tile = &key_shared[key_offset][dimension_offset];
+
+                    const MmaOperandB key_fragment = load_mma_b_k_transpose_from_row_major(key_tile, kHeadDimension);
+                    mma_m16n8k16_f16_f32(score_accumulators[score_subtile], query_fragment, key_fragment);
+                }
+            }
+
+            float upper_max = -CUDART_INF_F;
+            float lower_max = -CUDART_INF_F;
+
+            #pragma unroll
+            for(int score_subtile=0; score_subtile < kRawScoresSubtiles; score_subtile++){
+                upper_max = fmaxf(upper_max, fmaxf(score_accumulators[
+                    score_subtile
+                    ].registers[0] * scale,
+                    score_accumulators[score_subtile].registers[1] * scale
+                ));
+
+                lower_max = fmaxf(lower_max,
+                fmaxf(
+                    score_accumulators[score_subtile].registers[2] * scale,
+                    score_accumulators[score_subtile].registers[3] * scale
+                ));
+            }
+
+            upper_max = fmaxf(upper_max, __shfl_xor_sync(
+                kFullWarpMask,
+                upper_max,
+                1,
+                4
+            ));
+
+            upper_max = fmaxf(upper_max, __shfl_xor_sync(
+                kFullWarpMask,
+                upper_max,
+                2,
+                4
+            ));
+
+            lower_max = fmaxf(lower_max, __shfl_xor_sync(kFullWarpMask,lower_max, 1, 4));
+            lower_max = fmaxf(lower_max, __shfl_xor_sync(kFullWarpMask, lower_max, 2, 4));
+
+            const int upper_source_lane = (lane_id & 7) * 4;
+            const float canonical_upper_max = __shfl_sync(kFullWarpMask, upper_max, upper_source_lane);
+
+            const float canonical_lower_max = __shfl_sync(kFullWarpMask, lower_max, upper_source_lane);
+
+            float tile_row_max_from_raw = -CUDART_INF_F;
+
+            if(lane_id < 8){
+                tile_row_max_from_raw = canonical_upper_max;
+            }else if(lane_id < 16){
+                tile_row_max_from_raw = canonical_lower_max;
+            }
+
+            float new_row_max_for_lane = -CUDART_INF_F;
+            float previous_scale_for_lane = 0.0f;
+
+            if(lane_id < kQueryRowsPerWarp){
+                new_row_max_for_lane = fmaxf(running_row_max, tile_row_max_from_raw);
+
+                previous_scale_for_lane = running_row_sum == 0.0f ? 0.0f
+                : __expf(running_row_max - new_row_max_for_lane);
+
+                running_row_max = new_row_max_for_lane;
+
+                previous_scale_shared[warp_id][lane_id] = previous_scale_for_lane;
+            }
+
+            const int group_id = lane_id >> 2;
+            const float upper_new_row_max = __shfl_sync(kFullWarpMask, new_row_max_for_lane, group_id);
+            const float lower_new_row_max = __shfl_sync(kFullWarpMask, new_row_max_for_lane, group_id + 8);
+
+            
+            
+
+            float upper_probability_sum = 0.0f;
+            float lower_probability_sum = 0.0f;
+
+            #pragma unroll
+            for(int score_subtile = 0; score_subtile < kRawScoresSubtiles; ++score_subtile){
+                MmaAccumulator& score_accumulator = score_accumulators[score_subtile];
+
+                score_accumulator.registers[0] = __expf(score_accumulator.registers[0] * scale - upper_new_row_max);
+                score_accumulator.registers[1] = __expf(score_accumulator.registers[1] * scale - upper_new_row_max);
+                score_accumulator.registers[2] = __expf(score_accumulator.registers[2] * scale - lower_new_row_max);
+                score_accumulator.registers[3] = __expf(score_accumulator.registers[3] * scale - lower_new_row_max);
+
+                upper_probability_sum += score_accumulator.registers[0] + score_accumulator.registers[1];
+                lower_probability_sum += score_accumulator.registers[2] + score_accumulator.registers[3];
+            }
+
+            upper_probability_sum += __shfl_xor_sync(kFullWarpMask, upper_probability_sum, 1, 4);
+            upper_probability_sum += __shfl_xor_sync(kFullWarpMask, upper_probability_sum, 2, 4);
+            lower_probability_sum += __shfl_xor_sync(kFullWarpMask, lower_probability_sum, 1, 4);
+            lower_probability_sum += __shfl_xor_sync(kFullWarpMask, lower_probability_sum, 2, 4);
+
+            const int canonical_sum_source_lane = (lane_id & 7) * 4;
+            const float canonical_upper_sum = __shfl_sync(kFullWarpMask, upper_probability_sum, canonical_sum_source_lane);
+            const float canonical_lower_sum = __shfl_sync(kFullWarpMask, lower_probability_sum, canonical_sum_source_lane);
+
+            float tile_row_sum_from_raw = 0.0f;
+
+            if(lane_id < 8){
+                tile_row_sum_from_raw = canonical_upper_sum;
+            }else if(lane_id < 16){
+                tile_row_sum_from_raw = canonical_lower_sum;
+            }
+
+            if(lane_id < kQueryRowsPerWarp){
+                running_row_sum = previous_scale_for_lane * running_row_sum + tile_row_sum_from_raw;
+            }
+
+            #pragma unroll
+            for(int score_subtile = 0; score_subtile < kRawScoresSubtiles; score_subtile++){
+                #pragma unroll
+                for(int register_index = 0; register_index < 4; ++register_index){
+                    const int local_row = mma_accumulator_row(lane_id, register_index);
+                    const int local_column = score_subtile * kRawMmaOutputColumns + mma_accumulator_column(lane_id, register_index);
+
+                    probability_shared[warp_id][local_row][local_column] = __float2half_rn(score_accumulators[score_subtile].registers[register_index]);
+                }
+            }
+
+
+            
+         }else{
+            #pragma unroll
             for (
-                int dimension_offset = 0;
-                dimension_offset < kHeadDimension;
-                dimension_offset += kMmaK
+                int key_subtile_offset = 0;
+                key_subtile_offset < kKeyTileSize;
+                key_subtile_offset += kMmaN
             ) {
-                const half* query_tile =
-                    &query_shared[
-                        warp_id *
-                            kQueryRowsPerWarp
-                    ][
-                        dimension_offset
-                    ];
+                wmma::fragment<
+                    wmma::matrix_a,
+                    kMmaM,
+                    kMmaN,
+                    kMmaK,
+                    half,
+                    wmma::row_major
+                > query_fragment;
 
-                const half* key_transpose_tile =
-                    &key_shared[
-                        key_subtile_offset
-                    ][
-                        dimension_offset
-                    ];
+                /*
+                * K is physically stored as [Bc, 64]
+                * row-major.
+                *
+                * Loading it as a column-major matrix with
+                * leading dimension 64 reinterprets it as
+                * the required logical K^T tile [64,16].
+                */
+                wmma::fragment<
+                    wmma::matrix_b,
+                    kMmaM,
+                    kMmaN,
+                    kMmaK,
+                    half,
+                    wmma::col_major
+                > key_fragment;
 
-                wmma::load_matrix_sync(
-                    query_fragment,
-                    query_tile,
-                    kHeadDimension
-                );
+                wmma::fragment<
+                    wmma::accumulator,
+                    kMmaM,
+                    kMmaN,
+                    kMmaK,
+                    float
+                > score_fragment;
 
-                wmma::load_matrix_sync(
-                    key_fragment,
-                    key_transpose_tile,
-                    kHeadDimension
-                );
-
-                wmma::mma_sync(
+                wmma::fill_fragment(
                     score_fragment,
-                    query_fragment,
-                    key_fragment,
-                    score_fragment
+                    0.0f
+                );
+
+    #pragma unroll
+                for (
+                    int dimension_offset = 0;
+                    dimension_offset < kHeadDimension;
+                    dimension_offset += kMmaK
+                ) {
+                    const half* query_tile =
+                        &query_shared[
+                            warp_id *
+                                kQueryRowsPerWarp
+                        ][
+                            dimension_offset
+                        ];
+
+                    const half* key_transpose_tile =
+                        &key_shared[
+                            key_subtile_offset
+                        ][
+                            dimension_offset
+                        ];
+
+                    wmma::load_matrix_sync(
+                        query_fragment,
+                        query_tile,
+                        kHeadDimension
+                    );
+
+                    wmma::load_matrix_sync(
+                        key_fragment,
+                        key_transpose_tile,
+                        kHeadDimension
+                    );
+
+                    wmma::mma_sync(
+                        score_fragment,
+                        query_fragment,
+                        key_fragment,
+                        score_fragment
+                    );
+                }
+
+                /*
+                * Apply 1 / sqrt(D) while the score values
+                * are still in the FP32 WMMA accumulator.
+                */
+
+    #pragma unroll
+                for (
+                    int element = 0;
+                    element <
+                        score_fragment.num_elements;
+                    ++element
+                ) {
+                    score_fragment.x[element] *= scale;
+                }
+
+                /*
+                * score_shared has physical row stride Bc.
+                *
+                * With Bc=32:
+                *
+                *   subtile 0 -> columns  0-15
+                *   subtile 1 -> columns 16-31
+                */
+
+                wmma::store_matrix_sync(
+                    &score_shared[
+                        warp_id
+                    ][
+                        0
+                    ][
+                        key_subtile_offset
+                    ],
+                    score_fragment,
+                    kKeyTileSize,
+                    wmma::mem_row_major
                 );
             }
 
-            /*
-             * Apply 1 / sqrt(D) while the score values
-             * are still in the FP32 WMMA accumulator.
-             */
+         }
 
-#pragma unroll
-            for (
-                int element = 0;
-                element <
-                    score_fragment.num_elements;
-                ++element
-            ) {
-                score_fragment.x[element] *= scale;
-            }
-
-            /*
-             * score_shared has physical row stride Bc.
-             *
-             * With Bc=32:
-             *
-             *   subtile 0 -> columns  0-15
-             *   subtile 1 -> columns 16-31
-             */
-
-            wmma::store_matrix_sync(
-                &score_shared[
-                    warp_id
-                ][
-                    0
-                ][
-                    key_subtile_offset
-                ],
-                score_fragment,
-                kKeyTileSize,
-                wmma::mem_row_major
-            );
-        }
 
         /*
          * The score storage is warp-private, so only a
@@ -592,7 +782,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
          *
          * Lanes 0-15 each own one query row.
          */
-
+        if constexpr(!kUseRawQk){
         if (lane_id < kQueryRowsPerWarp) {
             const int local_row = lane_id;
 
@@ -677,7 +867,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                 local_row
             ] = previous_scale;
         }
-
+    }
         /*
          * Ensure every probability row and previous
          * scale is visible to all lanes in the warp.
@@ -706,6 +896,24 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         constexpr int kRawOutputSubtiles =
             kHeadDimension /
             kRawMmaOutputColumns;
+            
+
+            /*
+            Load the two P[16x16] reduction fragments once.
+            They are reused by every output-dim subtile
+
+            */
+
+            MmaOperandA probability_fragments[2];
+
+            #pragma unroll
+            for(int reduction_subtile = 0; reduction_subtile < 2; ++reduction_subtile){
+                const int reduction_offset = reduction_subtile * kMmaK;
+
+                const half* probability_tile = &probability_shared[warp_id][0][reduction_offset];
+
+                probability_fragments[reduction_subtile] = load_mma_a_row_major(probability_tile, kKeyTileSize);
+            }
 
         /*
         * Raw PV path:
@@ -737,31 +945,17 @@ __global__ void tensorcore_attention_forward_kernel_d64(
             */
     #pragma unroll
             for (
-                int reduction_offset = 0;
-                reduction_offset < kKeyTileSize;
-                reduction_offset += kMmaK
+                int reduction_subtile = 0;
+                reduction_subtile < 2;
+                reduction_subtile++
             ) {
-                const half* probability_tile =
-                    &probability_shared[
-                        warp_id
-                    ][
-                        0
-                    ][
-                        reduction_offset
-                    ];
+                const int reduction_offset = reduction_subtile * kMmaK;
 
-                const half* value_tile =
-                    &value_shared[
-                        reduction_offset
-                    ][
-                        output_dimension_offset
-                    ];
+                const half* value_tile = &value_shared[reduction_offset][output_dimension_offset];
+                
 
-                const MmaOperandA probability_fragment =
-                    load_mma_a_row_major(
-                        probability_tile,
-                        kKeyTileSize
-                    );
+                const MmaOperandA& probability_fragment = probability_fragments[reduction_subtile];
+
 
                 const MmaOperandB value_fragment =
                     load_mma_b_col_major_from_row_major(
@@ -1160,7 +1354,7 @@ void validate_tensorcore_attention_inputs(
 }
 
 
-template <int kKeyTileSize, bool kUseRawPv = false>
+template <int kKeyTileSize, bool kUseRawPv = false, bool kUseRawQk = false>
 torch::Tensor tensorcore_attention_forward_impl(
     torch::Tensor query,
     torch::Tensor key,
@@ -1274,7 +1468,7 @@ torch::Tensor tensorcore_attention_forward_impl(
         );
 
     tensorcore_attention_forward_kernel_d64<
-        kKeyTileSize, kUseRawPv
+        kKeyTileSize, kUseRawPv, kUseRawQk
     ><<<
         grid,
         block,
@@ -1336,6 +1530,22 @@ torch::Tensor tensorcore_attention_forward_bc32_raw_pv(
 ) {
     return tensorcore_attention_forward_impl<
         32,
+        true
+    >(
+        query,
+        key,
+        value
+    );
+}
+
+torch::Tensor tensorcore_attention_forward_bc32_raw_qk_raw_pv(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value
+) {
+    return tensorcore_attention_forward_impl<
+        32,
+        true,
         true
     >(
         query,

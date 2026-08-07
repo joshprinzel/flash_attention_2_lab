@@ -634,3 +634,746 @@ These aren't two separate problems — they're the same buffers (`pv_shared` bei
 
 ### Next experiment
 Rewrite PV accumulation and softmax reduction using raw `mma.sync.aligned.m16n8k16` PTX to get explicit thread-to-register fragment mapping, eliminating the `pv_shared` round trip entirely and replacing the serial softmax loop with warp-shuffle reduction across all 32 lanes. Target: raise `Block Limit Shared Mem` above 2, reduce short-scoreboard stall fraction below current 43%, re-profile and compare Compute/Memory SOL balance.
+
+
+## Experiment 6: Eliminate `pv_shared` with Explicit `ldmatrix` and `mma.sync`
+
+### Objective
+
+Remove the intermediate shared-memory materialization between the Tensor Core `PV` computation and the persistent FP32 output accumulator.
+
+The previous `Bc=32` kernel used WMMA for both matrix multiplications:
+
+```text
+QKᵀ:
+WMMA accumulator
+→ score_shared
+→ online softmax
+
+PV:
+WMMA accumulator
+→ pv_shared
+→ persistent FP32 output registers
+```
+
+Nsight Compute identified the kernel as limited by the L1/shared-memory execution path rather than DRAM bandwidth or Tensor Core throughput. The kernel also used enough shared memory to restrict residency to two blocks per SM.
+
+The objective of this experiment was to replace only the `PV` stage with explicit warp-level Tensor Core instructions while preserving the existing:
+
+* WMMA `QKᵀ` implementation
+* FP32 tilewise online softmax
+* `Bc=32` tile shape
+* Four-warps-per-block organization
+* FP32 persistent output accumulation
+
+This isolates the effect of eliminating `pv_shared`.
+
+---
+
+### Baseline
+
+The baseline was the fused `Bc=32` WMMA kernel:
+
+```text
+Br = 64
+Bc = 32
+D  = 64
+4 warps per block
+128 threads per block
+```
+
+Each warp owns 16 query rows and computes:
+
+```text
+P [16 × 32] × V [32 × 64]
+    →
+PV [16 × 64]
+```
+
+The WMMA implementation divided the output into four `16 × 16` fragments. Each fragment was accumulated in FP32, stored to shared memory, and then reloaded into ordinary FP32 registers:
+
+```text
+WMMA PV accumulator
+→ FP32 pv_shared
+→ warp synchronization
+→ FP32 output_accumulator
+```
+
+The intermediate buffer was:
+
+```cpp
+float pv_shared[4][16][64];
+```
+
+Its size was:
+
+```text
+4 warps × 16 rows × 64 dimensions × 4 bytes
+= 16,384 bytes
+```
+
+---
+
+### Profiling Motivation
+
+Nsight Compute reported the following for the `Bc=32` WMMA baseline at `N=1024`:
+
+| Metric                       |  Value |
+| ---------------------------- | -----: |
+| DRAM throughput              |  3.07% |
+| L1/TEX throughput            | 83.39% |
+| Compute throughput           | 21.53% |
+| Short-scoreboard stall share |  43.0% |
+| Theoretical occupancy        | 16.67% |
+| Achieved occupancy           | 16.45% |
+| Active warps per SM          |   7.90 |
+| Shared-memory block limit    |      2 |
+
+The low DRAM utilization showed that external memory bandwidth was not the limiting resource.
+
+The high L1/TEX utilization and short-scoreboard stall share indicated substantial pressure from shared-memory and MIO dependencies. Shared memory was also the binding occupancy constraint:
+
+```text
+2 blocks/SM × 4 warps/block
+= 8 resident warps/SM
+```
+
+The `pv_shared` buffer was the largest removable shared-memory allocation in the kernel.
+
+---
+
+### Implementation
+
+The new specialization retains WMMA for `QKᵀ`, but replaces the `PV` stage with explicit PTX-level Tensor Core operations:
+
+```text
+WMMA QKᵀ
+→ score_shared
+→ FP32 online softmax
+→ probability_shared
+→ ldmatrix
+→ mma.sync
+→ direct FP32 output-register merge
+```
+
+The new exported specialization is:
+
+```text
+tensorcore_attention_forward_bc32_raw_pv
+```
+
+#### Raw MMA Shape
+
+The raw instruction uses:
+
+```text
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+```
+
+Each instruction computes:
+
+```text
+A [16 × 16] × B [16 × 8]
+    →
+D [16 × 8]
+```
+
+The complete `PV` operation requires:
+
+```text
+64 output columns / 8 columns per MMA = 8 output subtiles
+
+32 reduction elements / 16 per MMA = 2 reduction steps
+
+8 output subtiles × 2 reduction steps
+= 16 mma.sync instructions per warp per K/V tile
+```
+
+For each output subtile:
+
+```text
+P[:,  0:16] × V[ 0:16, output columns]
++
+P[:, 16:32] × V[16:32, output columns]
+```
+
+is accumulated into four FP32 registers per lane.
+
+#### Operand Loading
+
+The probability operand is loaded from shared memory with:
+
+```text
+ldmatrix.sync.aligned.m8n8.x4.shared.b16
+```
+
+This collectively loads the `16 × 16` row-major probability fragment.
+
+The value operand is loaded with:
+
+```text
+ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16
+```
+
+This constructs the register representation required by the column-major B operand of the `row.col` MMA instruction from the physically row-major V tile.
+
+#### Persistent Register Ownership
+
+Explicit `mma.sync` exposes the logical output coordinates owned by every accumulator register.
+
+For each lane:
+
+```text
+group_id        = lane_id / 4
+thread_in_group = lane_id % 4
+```
+
+the four FP32 accumulator registers correspond to two elements from row `group_id` and two elements from row `group_id + 8`.
+
+The persistent output layout was changed to follow this same ownership:
+
+```text
+8 output subtiles × 4 FP32 registers per lane
+= 32 persistent output values per lane
+```
+
+This allows the Tensor Core result to be merged directly into the long-lived online-softmax numerator:
+
+```text
+mma.sync accumulator registers
+→ apply previous online-softmax scale
+→ persistent output_accumulator registers
+```
+
+No shared-memory store, synchronization, reload, or lane redistribution is required.
+
+---
+
+### Correctness
+
+The raw-PV specialization was compared against PyTorch scaled-dot-product attention for:
+
+| Batch | Heads | Sequence length | Head dimension |
+| ----: | ----: | --------------: | -------------: |
+|     1 |     1 |              32 |             64 |
+|     1 |     2 |              64 |             64 |
+|     1 |     4 |              96 |             64 |
+|     1 |     8 |             128 |             64 |
+|     1 |     8 |             512 |             64 |
+
+All tests passed with:
+
+```text
+rtol = 3e-2
+atol = 3e-2
+```
+
+The passing tests validate:
+
+* The `ldmatrix.x4` probability layout
+* The `ldmatrix.x2.trans` value layout
+* The raw MMA operand ordering
+* The two-step `K=32` reduction
+* Accumulator-register coordinate ownership
+* Direct integration with the online-softmax recurrence
+* Final normalization and FP16 output storage
+
+---
+
+### Compiler Resource Usage
+
+#### `Bc=32` WMMA PV baseline
+
+```text
+128 registers per thread
+45,568 bytes shared memory per block
+0-byte stack frame
+0 spill stores
+0 spill loads
+```
+
+#### `Bc=32` raw MMA PV
+
+```text
+79 registers per thread
+29,184 bytes shared memory per block
+0-byte stack frame
+0 spill stores
+0 spill loads
+```
+
+#### Resource Reduction
+
+| Resource                |  WMMA PV | Raw MMA PV |     Change |
+| ----------------------- | -------: | ---------: | ---------: |
+| Registers per thread    |      128 |         79 | **−38.3%** |
+| Shared memory per block | 45,568 B |   29,184 B | **−36.0%** |
+| Spill stores            |        0 |          0 |  Unchanged |
+| Spill loads             |        0 |          0 |  Unchanged |
+
+The shared-memory reduction was exactly:
+
+```text
+45,568 − 29,184
+= 16,384 bytes
+```
+
+This matches the removed `pv_shared` allocation.
+
+The register reduction was an additional benefit. Aligning Tensor Core accumulator ownership with persistent output ownership shortened live ranges and removed the WMMA store/reload path.
+
+---
+
+### Benchmark Results
+
+Benchmark configuration:
+
+```text
+GPU: NVIDIA GeForce RTX 4070 Laptop GPU
+Batch: 1
+Heads: 8
+Head dimension: 64
+Input/output dtype: FP16
+Softmax/output accumulation: FP32
+Causal masking: disabled
+```
+
+#### Median Latency
+
+| Sequence length | `Bc=32` WMMA PV | Raw MMA PV | Raw-PV improvement |
+| --------------: | --------------: | ---------: | -----------------: |
+|             128 |       0.0246 ms |  0.0252 ms |              −2.4% |
+|             512 |       0.0887 ms |  0.0841 ms |           **5.2%** |
+|            1024 |       0.3375 ms |  0.3156 ms |           **6.5%** |
+
+The difference at `N=128` is within the small-workload timing variation and should not be interpreted as a meaningful regression.
+
+At `N=512` and `N=1024`, the raw-PV implementation produced consistent latency reductions.
+
+#### Raw-PV Latency Distribution
+
+| Sequence length |       p10 |    Median |       p90 |
+| --------------: | --------: | --------: | --------: |
+|             128 | 0.0210 ms | 0.0252 ms | 0.0327 ms |
+|             512 | 0.0834 ms | 0.0841 ms | 0.0882 ms |
+|            1024 | 0.3148 ms | 0.3156 ms | 0.3271 ms |
+
+---
+
+### Nsight Compute Comparison
+
+The raw-PV specialization was profiled under the same `N=1024` workload as the WMMA baseline.
+
+| Metric                       |   WMMA PV | Raw MMA PV |             Change |
+| ---------------------------- | --------: | ---------: | -----------------: |
+| Profiled duration            | 546.43 µs |  506.40 µs |          **−7.3%** |
+| Theoretical occupancy        |    16.67% |     25.00% |           +8.33 pp |
+| Achieved occupancy           |    16.45% |     21.05% |           +4.60 pp |
+| Active warps per SM          |      7.90 |      10.10 |         **+27.8%** |
+| Shared-memory block limit    |         2 |          3 |           +1 block |
+| Register block limit         |         4 |          6 |          +2 blocks |
+| Short-scoreboard stall share |     43.0% |     37.64% |        Lower share |
+| L1/TEX throughput            |    83.39% |     88.60% | Higher utilization |
+| DRAM throughput              |     3.07% |      5.02% |          Still low |
+| Compute throughput           |    21.53% |     16.09% |              Lower |
+
+The profiler duration is instrumentation-dependent and should not replace normal benchmark latency. Its relative improvement, however, closely matches the ordinary benchmark result.
+
+---
+
+### Analysis
+
+#### Occupancy Improvement
+
+Removing `pv_shared` changed the shared-memory residency limit from two blocks to three blocks per SM:
+
+```text
+Before:
+2 blocks × 4 warps = 8 theoretical active warps/SM
+8 / 48 = 16.67% occupancy
+
+After:
+3 blocks × 4 warps = 12 theoretical active warps/SM
+12 / 48 = 25.00% occupancy
+```
+
+Achieved occupancy rose from 16.45% to 21.05%, while active warps per SM increased by approximately 28%.
+
+The raw kernel did not reach the full 25% theoretical occupancy throughout execution, but it gained meaningful additional scheduling capacity.
+
+#### Remaining Memory-Pipeline Pressure
+
+Although one large shared-memory round trip was eliminated, L1/TEX throughput increased from 83.39% to 88.60%.
+
+This is consistent with the higher number of resident warps issuing against the remaining shared-memory structures:
+
+```text
+query_shared
+key_shared
+value_shared
+score_shared
+probability_shared
+```
+
+The optimization shortened execution and increased concurrency, but the remaining shared-memory path became more heavily saturated.
+
+#### Short-Scoreboard Stalls
+
+The fraction of issue latency attributed to short-scoreboard dependencies decreased:
+
+```text
+43.0% → 37.64%
+```
+
+However, cycles between issued instructions increased, and the reported short-scoreboard component rose from approximately 5.0 to 6.7 cycles.
+
+Therefore, the result should not be described as eliminating the shared-memory bottleneck. Instead:
+
+> The `pv_shared` dependency was removed successfully, but the increased occupancy exposed the remaining score and probability shared-memory operations as the dominant bottleneck.
+
+#### Compute Throughput
+
+Compute utilization decreased despite the lower total latency.
+
+This does not indicate that the Tensor Core conversion failed. The kernel remains constrained by shared-memory and MIO dependencies, so the additional active warps do not translate into proportionally higher Tensor Core utilization.
+
+---
+
+### Key Findings
+
+This experiment demonstrated that explicit warp-level MMA ownership can remove an otherwise necessary WMMA shared-memory round trip.
+
+The raw-PV implementation:
+
+* Eliminated the 16 KiB `pv_shared` buffer
+* Removed FP32 PV stores and reloads
+* Reduced shared memory by 36%
+* Reduced registers per thread by 38%
+* Retained zero register spilling
+* Raised the shared-memory residency limit from two to three blocks per SM
+* Increased achieved active warps per SM by approximately 28%
+* Improved `N=512` latency by 5.2%
+* Improved `N=1024` latency by 6.5%
+
+The experiment also confirmed that the kernel remains limited by the shared-memory/L1 execution path rather than DRAM bandwidth or Tensor Core arithmetic throughput.
+
+---
+
+### Conclusion
+
+Replacing WMMA PV materialization with explicit:
+
+```text
+ldmatrix
++
+mma.sync.m16n8k16
++
+direct accumulator ownership
+```
+
+produced both a structural and measurable performance improvement.
+
+The primary benefit was not merely replacing one Tensor Core API with another. The explicit register mapping made it possible to preserve the MMA accumulator ownership through the online-softmax output update, avoiding a 16 KiB shared-memory buffer entirely.
+
+The improvement was largest for longer sequences, where the eliminated store/reload path was repeated across many K/V tiles.
+
+The remaining bottleneck is now the score path:
+
+```text
+WMMA QKᵀ accumulator
+→ score_shared
+→ scalar shared-memory softmax reads
+```
+
+---
+
+### Next Experiment
+
+The next specialization will convert `QKᵀ` from WMMA to explicit `mma.sync` and perform the softmax max and sum reductions directly from known accumulator-register ownership.
+
+Target flow:
+
+```text
+raw QKᵀ accumulator registers
+→ warp-level row maximum
+→ exponentiation
+→ warp-level row sum
+→ FP16 probability_shared
+→ raw MMA PV
+```
+
+The immediate target is to eliminate:
+
+```cpp
+float score_shared[4][16][32];
+```
+
+This buffer currently consumes:
+
+```text
+4 × 16 × 32 × 4 bytes
+= 8,192 bytes
+```
+
+Removing it would reduce shared memory from approximately:
+
+```text
+29,184 bytes
+```
+
+to:
+
+```text
+20,992 bytes
+```
+
+and should reduce shared-memory instruction volume and short-scoreboard dependencies. It may also raise the shared-memory residency limit from three to four blocks per SM, subject to the register count of the raw-QK specialization.
+
+
+
+# Experiment 7A: Raw QKᵀ + Register/Shuffle Softmax
+
+## Goal
+
+Remove the shared-memory score materialization path:
+
+```text
+WMMA QKᵀ
+→ score_shared
+→ scalar shared-memory softmax
+```
+
+and replace it with:
+
+```text
+raw ldmatrix + mma.sync QKᵀ
+→ FP32 score accumulators
+→ shuffle-based row max/sum
+→ probability_shared
+→ existing raw PV
+```
+
+The experiment intentionally retained `probability_shared` so that the already-correct raw-PV implementation remained unchanged.
+
+---
+
+## Implementation
+
+For each warp:
+
+```text
+Q [16 × 64]
+×
+Kᵀ [64 × 32]
+→
+S [16 × 32]
+```
+
+using:
+
+```text
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+```
+
+The score tile is divided into four `16×8` output subtiles and four `K=16` reduction steps:
+
+```text
+4 score subtiles
+×
+4 reduction steps
+=
+16 mma.sync instructions
+per warp per K/V tile
+```
+
+Q is loaded once per `K=16` slice and reused across all four score subtiles.
+
+Physical row-major K tiles are converted into the required logical `Kᵀ` operand using `ldmatrix.x2` with two adjacent `8×8` panels.
+
+After QK accumulation, scores remain in FP32 registers.
+
+Each four-lane subgroup owns two complete logical rows:
+
+```text
+upper row = group_id
+lower row = group_id + 8
+```
+
+Row maxima and probability sums are reduced using width-four warp shuffles:
+
+```cpp
+__shfl_xor_sync(..., 1, 4);
+__shfl_xor_sync(..., 2, 4);
+```
+
+The resulting statistics are exchanged with the canonical online-softmax state held in lanes 0–15.
+
+Probabilities are computed in registers and written directly to:
+
+```cpp
+probability_shared[4][16][32]
+```
+
+for consumption by the existing raw-PV path.
+
+The raw-QK specialization therefore eliminates `score_shared` entirely.
+
+---
+
+## Compiler Resources
+
+Previous raw-PV specialization:
+
+```text
+79 registers/thread
+29,184 bytes shared memory
+0 spills
+```
+
+Raw-QK + raw-PV specialization:
+
+```text
+70 registers/thread
+20,992 bytes shared memory
+0 spills
+```
+
+Comparison:
+
+| Resource            |   Raw PV | Raw QK + Raw PV |    Change |
+| ------------------- | -------: | --------------: | --------: |
+| Registers/thread    |       79 |              70 |    −11.4% |
+| Shared memory/block | 29,184 B |        20,992 B |    −28.1% |
+| Spill stores        |        0 |               0 | unchanged |
+| Spill loads         |        0 |               0 | unchanged |
+
+The shared-memory reduction is exactly:
+
+```text
+29,184 − 20,992
+= 8,192 bytes
+```
+
+matching the removed score buffer:
+
+```text
+4 × 16 × 32 × 4
+= 8,192 bytes
+```
+
+---
+
+## Benchmark Results
+
+Configuration:
+
+```text
+GPU: RTX 4070 Laptop
+B = 1
+H = 8
+D = 64
+FP16
+noncausal
+```
+
+|    N |    Raw PV | Raw QK + Raw PV |      Improvement |
+| ---: | --------: | --------------: | ---------------: |
+|  512 | 0.0839 ms |       0.0697 ms | **16.9% faster** |
+| 1024 | 0.3164 ms |       0.2322 ms | **26.6% faster** |
+
+Relative to PyTorch SDPA:
+
+```text
+N=512:
+1.66× → 1.38× SDPA latency
+
+N=1024:
+3.90× → 2.86× SDPA latency
+```
+
+---
+
+## Nsight Compute Results
+
+At `N=1024`:
+
+| Metric                |    Raw PV | Raw QK + Raw PV |
+| --------------------- | --------: | --------------: |
+| Profile duration      | 506.50 µs |   **358.02 µs** |
+| Theoretical occupancy |     25.0% |       **33.3%** |
+| Achieved occupancy    |    21.08% |      **28.99%** |
+| Active warps/SM       |     10.12 |       **13.91** |
+| Registers/thread      |        79 |          **70** |
+| Shared memory/block   | 29.18 KiB |   **20.99 KiB** |
+| Compute throughput    |    16.09% |      **23.56%** |
+| L1/TEX throughput     |    88.66% |      **92.02%** |
+| DRAM throughput       |     3.96% |       **5.46%** |
+
+Removing `score_shared` increased the shared-memory residency limit:
+
+```text
+3 blocks/SM
+→
+4 blocks/SM
+```
+
+giving:
+
+```text
+12 theoretical active warps/SM
+→
+16 theoretical active warps/SM
+```
+
+and approximately 37% more achieved active warps.
+
+---
+
+## New Bottleneck
+
+Experiment 7A successfully removed score materialization and scalar shared-memory softmax, but the remaining kernel is still strongly limited by the shared-memory/MIO path.
+
+Nsight reports:
+
+```text
+L1/TEX throughput:       92.02%
+DRAM throughput:          5.46%
+Compute throughput:      23.56%
+
+Shared-load conflicts:
+approximately 16.5-way
+
+Short-scoreboard stall:
+10.7 / 19.9 cycles
+≈ 53.9%
+```
+
+The increased short-scoreboard share does not indicate that Experiment 7A regressed dependency latency. Total kernel duration fell substantially; shared-memory dependencies simply became a larger fraction of the remaining execution time.
+
+The dominant remaining shared-memory traffic now includes:
+
+```text
+probability_shared
+K/V staging
+ldmatrix operand loads
+```
+
+---
+
+## Conclusion
+
+Experiment 7A was successful:
+
+```text
+raw QKᵀ
++
+shuffle softmax
++
+score_shared elimination
+```
+
+reduced shared memory by 8 KiB, lowered register usage, increased residency from three to four blocks per SM, raised achieved occupancy from approximately 21% to 29%, and improved `N=1024` normal benchmark latency by approximately 27%.
+
+The profile now points toward reducing repeated shared-memory operand traffic in the PV stage.
+
+The immediate next experiment should therefore hoist and reuse the two packed probability `ldmatrix` fragments across all eight PV output subtiles before attempting full removal of `probability_shared`.
