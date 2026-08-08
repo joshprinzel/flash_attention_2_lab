@@ -270,7 +270,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         sequence_length *
         kHeadDimension;
 
-
+    constexpr int kSharedHeadStride = kHeadDimension + 8; // 72 
     /*
      * Shared-memory layout
      *
@@ -285,21 +285,21 @@ __global__ void tensorcore_attention_forward_kernel_d64(
     half query_shared[
         kQueryTileSize
     ][
-        kHeadDimension
+        kSharedHeadStride
     ];
 
     __shared__ __align__(32)
     half key_shared[
         kKeyTileSize
     ][
-        kHeadDimension
+        kSharedHeadStride
     ];
 
     __shared__ __align__(32)
     half value_shared[
         kKeyTileSize
     ][
-        kHeadDimension
+        kSharedHeadStride
     ];
 
     constexpr int kScoreSharedWarps = kUseRawQk ? 1 : kWarpsPerBlock;
@@ -509,14 +509,14 @@ __global__ void tensorcore_attention_forward_kernel_d64(
             for(int dimension_offset = 0; dimension_offset < kHeadDimension; dimension_offset += kMmaK){
                 const half* query_tile = &query_shared[warp_id * kQueryRowsPerWarp][dimension_offset];
 
-                const MmaOperandA query_fragment = load_mma_a_row_major(query_tile, kHeadDimension);
+                const MmaOperandA query_fragment = load_mma_a_row_major(query_tile, kSharedHeadStride);
 
                 #pragma unroll
                 for(int score_subtile = 0; score_subtile < kRawScoresSubtiles; ++score_subtile){
                     const int key_offset = score_subtile * kRawMmaOutputColumns;
                     const half* key_tile = &key_shared[key_offset][dimension_offset];
 
-                    const MmaOperandB key_fragment = load_mma_b_k_transpose_from_row_major(key_tile, kHeadDimension);
+                    const MmaOperandB key_fragment = load_mma_b_k_transpose_from_row_major(key_tile, kSharedHeadStride);
                     mma_m16n8k16_f16_f32(score_accumulators[score_subtile], query_fragment, key_fragment);
                 }
             }
@@ -710,13 +710,13 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                     wmma::load_matrix_sync(
                         query_fragment,
                         query_tile,
-                        kHeadDimension
+                        kSharedHeadStride
                     );
 
                     wmma::load_matrix_sync(
                         key_fragment,
                         key_transpose_tile,
-                        kHeadDimension
+                        kSharedHeadStride
                     );
 
                     wmma::mma_sync(
@@ -960,7 +960,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                 const MmaOperandB value_fragment =
                     load_mma_b_col_major_from_row_major(
                         value_tile,
-                        kHeadDimension
+                        kSharedHeadStride
                     );
 
                 mma_m16n8k16_f16_f32(
@@ -1087,7 +1087,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                 wmma::load_matrix_sync(
                     value_fragment,
                     value_tile,
-                    kHeadDimension
+                    kSharedHeadStride
                 );
 
                 wmma::mma_sync(
