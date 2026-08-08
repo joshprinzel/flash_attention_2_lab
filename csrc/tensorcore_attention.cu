@@ -50,6 +50,41 @@ __device__ __forceinline__ uint32_t shared_address(const void* pointer){
     return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
 }
 
+__device__ __forceinline__ 
+void copy_global_to_shared_async_16(
+    half* shared_destination,
+    const half* global_source
+){
+    const uint32_t shared_destination_address = shared_address(shared_destination);
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;\n"
+        :
+        : "r"(shared_destination_address),
+          "l"(global_source)
+        : "memory"
+    );
+}
+
+__device__ __forceinline__
+void commit_async_copy_group() {
+    asm volatile(
+        "cp.async.commit_group;\n"
+        :
+        :
+        : "memory"
+    );
+}
+
+__device__ __forceinline__
+void wait_for_async_copy_group() {
+    asm volatile(
+        "cp.async.wait_group 0;\n"
+        :
+        :
+        : "memory"
+    );
+}
+
 __device__ __forceinline__ uint32_t pack_two_floats_to_half2(
     float first,
     float second
@@ -236,6 +271,34 @@ __device__ __forceinline__ MmaOperandA make_probability_mma_a(
     return fragment;
 }
 
+template<int kKeyTileSize>
+__device__ __forceinline__
+void stage_tile_async_16(
+    half* shared_tile,
+    const half* global_tensor,
+    int64_t tile_start,
+    int64_t tensor_base,
+    int shared_stride,
+    int thread_id
+){
+    constexpr int kHalfElementsPerAsyncCopy = 8;
+    constexpr int kCopiesPerRow = kHeadDimension / kHalfElementsPerAsyncCopy;
+    constexpr int kTileCopies = kKeyTileSize * kCopiesPerRow;
+
+    #pragma unroll 1
+    for(int copy = thread_id; copy < kTileCopies; copy += kThreadsPerBlock){
+        const int local_row = copy / kCopiesPerRow;
+        const int copy_within_row = copy % kCopiesPerRow;
+        const int dimension = copy_within_row * kHalfElementsPerAsyncCopy;
+
+        const int64_t global_row = tile_start + local_row;
+        const int64_t global_index = tensor_base + global_row * kHeadDimension + dimension;
+
+        copy_global_to_shared_async_16(&shared_tile[local_row * shared_stride + dimension], &global_tensor[global_index]);
+    }
+
+}
+
 
 template <int kKeyTileSize, bool kUseRawPv = false, bool kUseRawQk = false>
 __global__ void tensorcore_attention_forward_kernel_d64(
@@ -316,8 +379,11 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         kSharedHeadStride
     ];
 
+    constexpr int kKeySharedStages = (kUseRawQk && kUseRawPv) ? 2 : 1;
+
     __shared__ __align__(32)
-    half key_shared[
+    half key_shared[kKeySharedStages]
+    [
         kKeyTileSize
     ][
         kSharedHeadStride
@@ -456,6 +522,33 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
     __syncthreads();
 
+    if constexpr(kUseRawQk && kUseRawPv){
+        /*
+        Prime pipeline with K0 and V0.
+        */
+
+        stage_tile_async_16<kKeyTileSize>(
+            &key_shared[0][0][0],
+            key,
+            0,
+            tensor_base,
+            kSharedHeadStride,
+            thread_id
+        );
+        stage_tile_async_16<kKeyTileSize>(
+            &value_shared[0][0],
+            value,
+            0,
+            tensor_base,
+            kSharedHeadStride,
+            thread_id
+        );
+
+        commit_async_copy_group();
+        wait_for_async_copy_group();
+        __syncthreads();
+    }
+
 
     /*
      * Iterate over K/V tiles.
@@ -474,43 +567,60 @@ __global__ void tensorcore_attention_forward_kernel_d64(
          * boundary predicate is required here.
          */
 
-        constexpr int kKeyValueElements =
-            kKeyTileSize * kHeadDimension;
+         const int key_stage = (kUseRawPv && kUseRawQk) ? ((key_tile_start / kKeyTileSize) & 1) : 0;
 
-        for (
-            int element = thread_id;
-            element < kKeyValueElements;
-            element += kThreadsPerBlock
-        ) {
-            const int local_key_row =
-                element / kHeadDimension;
+        const int64_t next_key_tile_start = key_tile_start + kKeyTileSize;
+        const bool has_next_tile = next_key_tile_start < sequence_length;
 
-            const int dimension =
-                element % kHeadDimension;
+        if constexpr(kUseRawQk && kUseRawPv){
+            /*
+            K[current] and V[current] are already ready.
 
-            const int64_t global_key_row =
-                key_tile_start + local_key_row;
+            Launch K[next] into the alternate K buffer.
+            It can now move while we compute the current tile
+            */
 
-            const int64_t global_index =
-                tensor_base +
-                global_key_row *
-                    kHeadDimension +
-                dimension;
+            if(has_next_tile){
+                const int next_key_stage = key_stage ^ 1;
+                stage_tile_async_16<kKeyTileSize>(
+                    &key_shared[next_key_stage][0][0],
+                    key,
+                    next_key_tile_start,
+                    tensor_base,
+                    kSharedHeadStride,
+                    thread_id
+                );
 
-            key_shared[
-                local_key_row
-            ][
-                dimension
-            ] = key[global_index];
+                commit_async_copy_group();
+            }
+        }else{
+                /*
+                Preserve the existing non-pipelined behavior for
+                legacy specialization.
+                */
 
-            value_shared[
-                local_key_row
-            ][
-                dimension
-            ] = value[global_index];
-        }
+                stage_tile_async_16<kKeyTileSize>(
+                    &key_shared[0][0][0],
+                    key,
+                    key_tile_start,
+                    tensor_base,
+                    kSharedHeadStride,
+                    thread_id
+                );
 
-        __syncthreads();
+                stage_tile_async_16<kKeyTileSize>(
+                    &value_shared[0][0],
+                    value,
+                    key_tile_start,
+                    tensor_base,
+                    kSharedHeadStride,
+                    thread_id
+                );
+
+                commit_async_copy_group();
+                wait_for_async_copy_group();
+                __syncthreads();
+            }
 
 
         /*
@@ -546,7 +656,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                 #pragma unroll
                 for(int score_subtile = 0; score_subtile < kRawScoresSubtiles; ++score_subtile){
                     const int key_offset = score_subtile * kRawMmaOutputColumns;
-                    const half* key_tile = &key_shared[key_offset][dimension_offset];
+                    const half* key_tile = &key_shared[key_stage][key_offset][dimension_offset];
 
                     const MmaOperandB key_fragment = load_mma_b_k_transpose_from_row_major(key_tile, kSharedHeadStride);
                     mma_m16n8k16_f16_f32(score_accumulators[score_subtile], query_fragment, key_fragment);
@@ -727,7 +837,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                         ];
 
                     const half* key_transpose_tile =
-                        &key_shared[
+                        &key_shared[key_stage][
                             key_subtile_offset
                         ][
                             dimension_offset
@@ -1204,11 +1314,50 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         }
     }
 
+    
     /*
-    * All warps must finish consuming the current K/V tile
-    * before any thread overwrites shared K and V storage.
+    Everyone must finish consuming V[current]
+    before value_shared is reused
+
+    K[next] has been moving async during the 
+    current Qk/softmax/PV work.
     */
+
     __syncthreads();
+    if constexpr(kUseRawQk && kUseRawPv){
+        if(has_next_tile){
+            /*
+            K[next] must be complete before the next
+            iteration consumes its k stage.
+            */
+
+            wait_for_async_copy_group();
+
+            /*
+            V has only one buffer, so V[next] cannot be
+            loaded until every warp has finished PV[current].
+            */
+
+            stage_tile_async_16<kKeyTileSize>(
+                &value_shared[0][0],
+                value,
+                next_key_tile_start,
+                tensor_base,
+                kSharedHeadStride,
+                thread_id
+            );
+
+            commit_async_copy_group();
+            wait_for_async_copy_group();
+
+            /*
+            Make V[next] visible to every warp before
+            starting the next iteration.
+            */
+
+            __syncthreads();
+        }
+    }
 }
 
 

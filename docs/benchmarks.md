@@ -1525,3 +1525,94 @@ eliminate the remaining shared-memory round trip
 ```
 
 With shared-memory operand conflicts largely resolved, the next bottleneck shifted to the kernel epilogue, where the final FP16 output stores showed poor global-memory coalescing.
+
+
+## Experiment 7C — Vectorize Final Output Stores
+
+### Motivation
+
+After eliminating the major shared-memory bottlenecks, Nsight Compute identified the final FP16 output epilogue as a remaining memory-layout inefficiency.
+
+The raw MMA accumulator ownership distributed adjacent output values across register pairs, but the kernel stored each FP16 value individually. Each scalar store instruction therefore exposed a sparse warp-wide address pattern to the global-memory coalescer.
+
+Before the change, Nsight reported:
+
+```text
+Useful bytes per 32-byte sector:     8
+Excessive global sectors:       98,304
+```
+
+### Change
+
+Adjacent MMA accumulator registers belonging to the same output row were paired:
+
+```text
+registers (0,1)
+registers (2,3)
+```
+
+Each pair was normalized together, converted from FP32 to FP16 with `__floats2half2_rn`, and written using one 32-bit `half2` store.
+
+This changed the epilogue from:
+
+```text
+4 × scalar FP16 stores per MMA subtile
+```
+
+to:
+
+```text
+2 × packed FP16x2 stores per MMA subtile
+```
+
+No cross-lane shuffles or register transpose were required.
+
+### Profiling result
+
+After vectorization:
+
+```text
+Useful bytes per 32-byte sector:    16
+Excessive global sectors:       32,768
+```
+
+The excessive sector count fell by approximately **66.7%**, while useful bytes per transaction doubled.
+
+Profiler kernel duration also improved:
+
+```text
+Before: 144.80 us
+After:  139.94 us
+
+Improvement: ~3.4%
+```
+
+Resource usage remained unchanged:
+
+```text
+Registers/thread:      75
+Static shared memory:  18.94 KiB
+Spills:                 0
+```
+
+### Benchmark result
+
+```text
+N=512:
+0.0407 ms → 0.0353 ms
+~13.3% faster
+
+N=1024:
+0.1010 ms → 0.0998 ms
+~1.2% faster
+```
+
+The remaining uncoalesced accesses represented only a small fraction of total memory sectors, so a more complex warp-level epilogue transpose was not pursued.
+
+### Conclusion
+
+Experiment 7C improved output-store coalescing by exploiting the natural adjacency already present in MMA accumulator register pairs.
+
+The cheap `half2` transformation captured most of the available epilogue improvement without additional shared memory, shuffles, or register pressure.
+
+With the major layout and materialization inefficiencies removed, optimization now shifts from reducing memory traffic to **overlapping unavoidable K/V data movement with Tensor Core computation**.
