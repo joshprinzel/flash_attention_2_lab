@@ -50,6 +50,19 @@ __device__ __forceinline__ uint32_t shared_address(const void* pointer){
     return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
 }
 
+__device__ __forceinline__ uint32_t pack_two_floats_to_half2(
+    float first,
+    float second
+){
+    union{
+        half2 half_values;
+        uint32_t bits;
+    } packed;
+
+    packed.half_values = __floats2half2_rn(first, second);
+    return packed.bits;
+}
+
 __device__ __forceinline__ MmaOperandA load_mma_a_row_major(
     const half* matrix,
     int leading_dimension
@@ -208,6 +221,21 @@ int mma_accumulator_column(
     return thread_in_group * 2 + (register_index & 1);
 }
 
+__device__ __forceinline__ MmaOperandA make_probability_mma_a(
+    const MmaAccumulator& first_score_subtile,
+    const MmaAccumulator& second_score_subtile
+){
+    MmaOperandA fragment;
+
+    fragment.registers[0] = pack_two_floats_to_half2(first_score_subtile.registers[0], first_score_subtile.registers[1]);
+    fragment.registers[1] = pack_two_floats_to_half2(first_score_subtile.registers[2], first_score_subtile.registers[3]);
+
+    fragment.registers[2] = pack_two_floats_to_half2(second_score_subtile.registers[0], second_score_subtile.registers[1]);
+    fragment.registers[3] = pack_two_floats_to_half2(second_score_subtile.registers[2], second_score_subtile.registers[3]);
+
+    return fragment;
+}
+
 
 template <int kKeyTileSize, bool kUseRawPv = false, bool kUseRawQk = false>
 __global__ void tensorcore_attention_forward_kernel_d64(
@@ -315,13 +343,16 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         kScoreSharedColumns
     ];
 
+    constexpr int kProbabilitySharedWarps = kUseRawQk ? 1 : kWarpsPerBlock;
+    constexpr int kProbabilitySharedRows = kUseRawQk ? 1 : kQueryRowsPerWarp;
+    constexpr int kProbabilitySharedColumns = kUseRawQk ? 1 : kKeyTileSize;
     __shared__ __align__(32)
     half probability_shared[
-        kWarpsPerBlock
+        kProbabilitySharedWarps
     ][
-        kQueryRowsPerWarp
+        kProbabilitySharedRows
     ][
-        kKeyTileSize
+        kProbabilitySharedColumns
     ];
 
     /*
@@ -494,6 +525,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
          * score tiles.
          */
 
+         MmaOperandA probability_fragments_from_registers[2];
          if constexpr (kUseRawQk){
             constexpr int kRawMmaOutputColumns = 8;
 
@@ -627,16 +659,10 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                 running_row_sum = previous_scale_for_lane * running_row_sum + tile_row_sum_from_raw;
             }
 
-            #pragma unroll
-            for(int score_subtile = 0; score_subtile < kRawScoresSubtiles; score_subtile++){
-                #pragma unroll
-                for(int register_index = 0; register_index < 4; ++register_index){
-                    const int local_row = mma_accumulator_row(lane_id, register_index);
-                    const int local_column = score_subtile * kRawMmaOutputColumns + mma_accumulator_column(lane_id, register_index);
+            probability_fragments_from_registers[0] = make_probability_mma_a(score_accumulators[0], score_accumulators[1]);
+            probability_fragments_from_registers[1] = make_probability_mma_a(score_accumulators[2], score_accumulators[3]);
 
-                    probability_shared[warp_id][local_row][local_column] = __float2half_rn(score_accumulators[score_subtile].registers[register_index]);
-                }
-            }
+            
 
 
             
@@ -906,15 +932,37 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
             MmaOperandA probability_fragments[2];
 
+            if constexpr (kUseRawQk) {
+                probability_fragments[0] =
+                    probability_fragments_from_registers[0];
+
+                probability_fragments[1] =
+                    probability_fragments_from_registers[1];
+            } else {
             #pragma unroll
-            for(int reduction_subtile = 0; reduction_subtile < 2; ++reduction_subtile){
-                const int reduction_offset = reduction_subtile * kMmaK;
+                for(int reduction_subtile = 0;
+                    reduction_subtile < 2;
+                    ++reduction_subtile) {
 
-                const half* probability_tile = &probability_shared[warp_id][0][reduction_offset];
+                    const int reduction_offset =
+                        reduction_subtile * kMmaK;
 
-                probability_fragments[reduction_subtile] = load_mma_a_row_major(probability_tile, kKeyTileSize);
+                    const half* probability_tile =
+                        &probability_shared[
+                            warp_id
+                        ][
+                            0
+                        ][
+                            reduction_offset
+                        ];
+
+                    probability_fragments[reduction_subtile] =
+                        load_mma_a_row_major(
+                            probability_tile,
+                            kKeyTileSize
+                        );
+                }
             }
-
         /*
         * Raw PV path:
         *
@@ -1191,21 +1239,37 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         #pragma unroll
         for(int output_subtiles = 0; output_subtiles < kRawOutputSubtiles; output_subtiles++){
             #pragma unroll
-            for(int register_index = 0; register_index < 4; register_index++){
-                const int local_row = mma_accumulator_row(lane_id, register_index);
-                const int dimension = output_subtiles * kRawMmaOutputColumns + 
-                mma_accumulator_column(lane_id, register_index);
+            for(int register_pair = 0; register_pair < 2; ++register_pair){
+                const int register_index = register_pair * 2;
 
+                /*
+                (0,1) belong to the same upper row
+                (2,3) belong to the same lower row
+                */
+
+                const int local_row = mma_accumulator_row(lane_id, register_index);
+
+                /*
+                register_index is 0 or 2. so this gives
+                the even column of the contiguous pair
+                */
+
+                const int dimension = output_subtiles * kRawMmaOutputColumns + mma_accumulator_column(lane_id, register_index);
                 const int accumulator_index = output_subtiles * 4 + register_index;
+
                 const int64_t global_query_row = query_tile_start + warp_id * kQueryRowsPerWarp + local_row;
 
                 if(global_query_row < sequence_length){
-                    const float normalized_output = output_accumulator[accumulator_index] *
-                    inverse_sum_shared[warp_id][local_row];
+                    const float inverse_sum = inverse_sum_shared[warp_id][local_row];
+
+                    const float first = output_accumulator[accumulator_index] * inverse_sum;
+                    const float second = output_accumulator[accumulator_index + 1] * inverse_sum;
+
+                    const half2 packed_output = __floats2half2_rn(first, second);
 
                     const int64_t global_index = tensor_base + global_query_row * kHeadDimension + dimension;
 
-                    output[global_index] = __float2half_rn(normalized_output);
+                    *reinterpret_cast<half2*>(&output[global_index]) = packed_output;
                 }
             }
         }

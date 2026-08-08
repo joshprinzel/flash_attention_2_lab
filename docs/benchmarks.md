@@ -1377,3 +1377,151 @@ reduced shared memory by 8 KiB, lowered register usage, increased residency from
 The profile now points toward reducing repeated shared-memory operand traffic in the PV stage.
 
 The immediate next experiment should therefore hoist and reuse the two packed probability `ldmatrix` fragments across all eight PV output subtiles before attempting full removal of `probability_shared`.
+
+
+## Experiment 7B — Eliminate `probability_shared`
+
+### Motivation
+
+After fixing the Q/K/V shared-memory layouts in Experiment 7A.6, the remaining conflicted `ldmatrix` traffic came from the probability operand used by the raw PV Tensor Core path.
+
+The raw-QK path already produced the softmax probabilities in registers, but the kernel still performed an unnecessary round trip:
+
+```text
+QK accumulator registers
+    ↓
+register softmax
+    ↓
+store FP16 probabilities to probability_shared
+    ↓
+ldmatrix probability_shared
+    ↓
+PV mma.sync
+```
+
+`probability_shared` occupied:
+
+```text
+4 warps × 16 rows × 32 columns × 2 bytes
+= 4096 bytes
+```
+
+The goal of Experiment 7B was to keep the probability tile entirely in registers and feed it directly into the PV `mma.sync` operation.
+
+### Register-layout observation
+
+The raw-QK accumulator ownership already matched the layout required by the `m16n8k16` multiplicand-A fragment closely enough that no cross-lane shuffle was required.
+
+For each lane, adjacent FP32 probability values could be converted to FP16 and packed directly into the four 32-bit registers of `MmaOperandA`.
+
+The mapping was:
+
+```text
+score_accumulator[0] + score_accumulator[1]
+    → probability columns 0:16
+
+score_accumulator[2] + score_accumulator[3]
+    → probability columns 16:32
+```
+
+Each pair of adjacent FP32 values was converted with `__floats2half2_rn` and packed into one 32-bit MMA operand register.
+
+The new path became:
+
+```text
+QK accumulator registers
+    ↓
+register softmax
+    ↓
+FP32 → packed FP16x2
+    ↓
+MmaOperandA registers
+    ↓
+PV mma.sync
+```
+
+### Implementation strategy
+
+The change was introduced in two stages.
+
+First, the register-built probability fragments were used by raw PV while the existing `probability_shared` stores were left in place. This isolated the register-layout transformation from the shared-memory removal. The full correctness suite passed, confirming that the packed register ownership matched the Tensor Core operand layout.
+
+After validating the mapping, the raw-QK probability stores were removed and `probability_shared` was reduced to a compile-time placeholder for the `<32, true, true>` specialization. Legacy kernel specializations that still require the shared probability tile were left unchanged.
+
+### Resource impact
+
+The final raw-QK/raw-PV specialization used:
+
+```text
+Registers per thread:          75
+Static shared memory:       18.94 KiB
+Local-memory spills:            0
+Shared-memory block limit:      5
+Register block limit:           6
+Theoretical occupancy:      41.67%
+Achieved occupancy:         28.20%
+```
+
+Removing the 4 KiB probability tile moved the shared-memory residency limit from four blocks per SM to five.
+
+The higher theoretical residency did not fully translate into higher achieved occupancy for the N=1024 benchmark because the launch contained only 128 blocks across 36 SMs, corresponding to approximately 0.71 full waves.
+
+Therefore, the measured latency improvement is attributed primarily to eliminating the probability shared-memory store/load round trip rather than increased realized occupancy.
+
+### Performance
+
+For the primary N=1024 workload:
+
+```text
+After Q/K/V padding:       0.1081 ms
+After register P path:     0.1010 ms
+
+Improvement:                 ~6.6%
+Relative to PyTorch SDPA:    1.24× latency
+```
+
+At N=512 the result was approximately neutral to slightly slower:
+
+```text
+Before: 0.0394 ms
+After:  0.0407 ms
+```
+
+The larger workload therefore remains the more representative target for this optimization.
+
+### Profiling result
+
+After Experiment 7B, the previously problematic probability `ldmatrix` load disappeared entirely.
+
+Combined with the padded Q/K/V layouts from Experiment 7A.6, the major Tensor Core shared-memory operand loads now showed zero excessive shared-memory wavefronts.
+
+Scheduler behavior also improved substantially relative to the earlier shared-memory-bound kernel:
+
+```text
+One-or-more eligible schedulers:  38.82%
+Warp cycles / issued instruction:  8.65
+L1/TEX throughput:                 52.93%
+Compute throughput:                48.60%
+```
+
+The kernel had therefore transitioned away from being dominated by pathological shared-memory accesses toward a more balanced execution profile.
+
+### Conclusion
+
+Experiment 7B removed the final unnecessary probability-tile materialization from the raw-QK/raw-PV path.
+
+The optimization produced a ~6.6% latency reduction at N=1024, reduced static shared-memory usage by approximately 4 KiB, raised theoretical block residency, and eliminated the remaining probability `ldmatrix` traffic.
+
+The optimization sequence up to this point demonstrates a consistent strategy:
+
+```text
+remove intermediate materialization
+    ↓
+reuse operands in registers
+    ↓
+fix pathological shared-memory layouts
+    ↓
+eliminate the remaining shared-memory round trip
+```
+
+With shared-memory operand conflicts largely resolved, the next bottleneck shifted to the kernel epilogue, where the final FP16 output stores showed poor global-memory coalescing.
