@@ -1616,3 +1616,127 @@ Experiment 7C improved output-store coalescing by exploiting the natural adjacen
 The cheap `half2` transformation captured most of the available epilogue improvement without additional shared memory, shuffles, or register pressure.
 
 With the major layout and materialization inefficiencies removed, optimization now shifts from reducing memory traffic to **overlapping unavoidable K/V data movement with Tensor Core computation**.
+
+
+
+## Experiment 7D — Asynchronous K/V Staging and Software Pipelining
+
+### Motivation
+
+After eliminating the major shared-memory materializations and bank conflicts, K/V tile staging remained a significant source of overhead.
+
+The existing path effectively performed:
+
+```text
+global load
+→ registers
+→ shared-memory store
+→ Tensor Core consumption
+```
+
+The goal of 7D was to replace this with direct asynchronous global-to-shared transfers and then overlap unavoidable memory movement with Tensor Core computation.
+
+### 7D.1 — `cp.async` Staging
+
+K/V staging was converted to 16-byte `cp.async` transfers using:
+
+```text
+cp.async.cg.shared.global
+cp.async.commit_group
+cp.async.wait_group
+```
+
+Even with the commit and wait initially back-to-back, this removed a large scalar load/store instruction stream.
+
+At N=1024:
+
+```text
+Before cp.async:     ~0.0998 ms
+Rolled cp.async:     ~0.0800 ms
+```
+
+The fully unrolled copy loop reached approximately `0.0786 ms`, but increased register pressure from 72 to 99 registers/thread. The rolled version was retained as the pipelining base because it preserved register headroom.
+
+### 7D.2 — K Double Buffering
+
+A second shared-memory K stage was added so `K[t+1]` could be prefetched while tile `t` executed.
+
+The fast path became:
+
+```text
+prefetch K[t+1]
+      ↓
+QK[t]
+softmax[t]
+PV[t]
+      ↓
+wait K[t+1]
+```
+
+K-only overlap produced little improvement at N=1024, indicating that K latency alone was no longer the dominant exposed cost.
+
+### 7D.3 — Overlap V With QK/Softmax
+
+V remained single-buffered, but its lifetime allowed a more efficient schedule.
+
+`V[t]` is not required until PV, so its asynchronous transfer can overlap:
+
+```text
+V[t] async ─────────────┐
+                       │
+QK[t]                  │
+softmax[t]             │
+                       ↓
+wait V[t]
+PV[t]
+```
+
+Meanwhile, `K[t+1]` remains in flight in the alternate K stage.
+
+The final pipeline uses separate asynchronous copy groups and `cp.async.wait_group 1` to guarantee V readiness while allowing the newer K prefetch to remain outstanding.
+
+### Result
+
+At N=1024:
+
+```text
+7C — pre-cp.async:          ~0.0998 ms
+7D.1 — rolled cp.async:     ~0.0800 ms
+7D.1 — unrolled cp.async:   ~0.0786 ms
+7D.2 — K-only pipeline:      0.0805 ms
+7D.3 — K/V pipeline:         0.0781 ms
+```
+
+Most of the 7D improvement therefore came from replacing scalar staging with direct 128-bit `cp.async` transfers. Software pipelining provided a smaller additional gain.
+
+### Profiling Result
+
+The final 7D.3 kernel uses:
+
+```text
+72 registers/thread
+23,552 B shared memory/block
+33.3% theoretical occupancy
+25.9% achieved occupancy
+```
+
+Shared memory is now the block-residency limiter.
+
+The second K stage lowers theoretical occupancy from the previous 41.7% to 33.3%, but the pipeline improves latency hiding:
+
+```text
+Warp cycles / issued instruction:
+12.16 → ~9.8
+```
+
+Nsight now reports Tensor as the most utilized execution pipeline and math-pipe throttling as a major warp stall source.
+
+This indicates that the kernel has shifted away from being dominated by avoidable staging latency and toward being constrained by how effectively enough active work can be supplied to the execution pipelines.
+
+### Conclusion
+
+7D successfully replaced expensive scalar K/V staging with direct asynchronous copies and demonstrated working software pipelining across K, V, QK, softmax, and PV.
+
+Further pipeline complexity is unlikely to provide high ROI because the additional K stage already makes shared memory the occupancy limiter.
+
+The next optimization phase therefore shifts from changing the instruction path to **retuning resource usage and execution geometry so the existing fast path remains better fed**.

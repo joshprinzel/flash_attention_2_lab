@@ -85,6 +85,16 @@ void wait_for_async_copy_group() {
     );
 }
 
+__device__ __forceinline__
+void wait_for_async_copy_group_1() {
+    asm volatile(
+        "cp.async.wait_group 1;\n"
+        :
+        :
+        : "memory"
+    );
+}
+
 __device__ __forceinline__ uint32_t pack_two_floats_to_half2(
     float first,
     float second
@@ -279,14 +289,15 @@ void stage_tile_async_16(
     int64_t tile_start,
     int64_t tensor_base,
     int shared_stride,
-    int thread_id
+    int thread_id,
+    int thread_count
 ){
     constexpr int kHalfElementsPerAsyncCopy = 8;
     constexpr int kCopiesPerRow = kHeadDimension / kHalfElementsPerAsyncCopy;
     constexpr int kTileCopies = kKeyTileSize * kCopiesPerRow;
 
     #pragma unroll 1
-    for(int copy = thread_id; copy < kTileCopies; copy += kThreadsPerBlock){
+    for(int copy = thread_id; copy < kTileCopies; copy += thread_count){
         const int local_row = copy / kCopiesPerRow;
         const int copy_within_row = copy % kCopiesPerRow;
         const int dimension = copy_within_row * kHalfElementsPerAsyncCopy;
@@ -315,14 +326,18 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         "Only Bc=16 and Bc=32 are supported"
     );
 
+    constexpr int kKernelWarpsPerBlock = (kUseRawQk && kUseRawPv) ? 4 : kWarpsPerBlock;
+    constexpr int kKernelThreadsPerBlock = kWarpSize * kKernelWarpsPerBlock;
+    constexpr int kKernelQueryTileSize = kKernelWarpsPerBlock * kQueryRowsPerWarp;
+
     static_assert(
         kKeyTileSize % kMmaK == 0,
         "Key tile must be divisible by the MMA K dimension"
     );
 
     static_assert(
-        kQueryTileSize ==
-            kWarpsPerBlock * kQueryRowsPerWarp
+        kKernelQueryTileSize ==
+            kKernelWarpsPerBlock * kQueryRowsPerWarp
     );
 
     static_assert(
@@ -340,6 +355,8 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         "The raw Qk experiment requires the raw PV path"
     );
 
+    
+
     const int thread_id =
         static_cast<int>(threadIdx.x);
 
@@ -354,7 +371,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
     const int64_t query_tile_start =
         static_cast<int64_t>(blockIdx.x) *
-        kQueryTileSize;
+        kKernelQueryTileSize;
 
     const int64_t tensor_base =
         batch_head_index *
@@ -374,7 +391,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
     __shared__ __align__(32)
     half query_shared[
-        kQueryTileSize
+        kKernelQueryTileSize
     ][
         kSharedHeadStride
     ];
@@ -396,7 +413,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         kSharedHeadStride
     ];
 
-    constexpr int kScoreSharedWarps = kUseRawQk ? 1 : kWarpsPerBlock;
+    constexpr int kScoreSharedWarps = kUseRawQk ? 1 : kKernelWarpsPerBlock;
     constexpr int kScoreSharedRows = kUseRawQk ? 1 : kQueryRowsPerWarp;
     constexpr int kScoreSharedColumns = kUseRawQk ? 1 : kKeyTileSize;
 
@@ -409,7 +426,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         kScoreSharedColumns
     ];
 
-    constexpr int kProbabilitySharedWarps = kUseRawQk ? 1 : kWarpsPerBlock;
+    constexpr int kProbabilitySharedWarps = kUseRawQk ? 1 : kKernelWarpsPerBlock;
     constexpr int kProbabilitySharedRows = kUseRawQk ? 1 : kQueryRowsPerWarp;
     constexpr int kProbabilitySharedColumns = kUseRawQk ? 1 : kKeyTileSize;
     __shared__ __align__(32)
@@ -427,7 +444,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
     while avoiding the 16 KiB allocation.
     */
 
-    constexpr int kPvSharedWarps = kUseRawPv ? 1 : kWarpsPerBlock;
+    constexpr int kPvSharedWarps = kUseRawPv ? 1 : kKernelWarpsPerBlock;
     constexpr int kPvSharedRows = kUseRawPv ? 1 : kQueryRowsPerWarp;
     constexpr int kPvSharedColumns = kUseRawPv ? 1 : kHeadDimension;
     __shared__ __align__(32)
@@ -441,14 +458,14 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
     __shared__ __align__(32)
     float previous_scale_shared[
-        kWarpsPerBlock
+        kKernelWarpsPerBlock
     ][
         kQueryRowsPerWarp
     ];
 
     __shared__ __align__(32)
     float inverse_sum_shared[
-        kWarpsPerBlock
+        kKernelWarpsPerBlock
     ][
         kQueryRowsPerWarp
     ];
@@ -483,12 +500,12 @@ __global__ void tensorcore_attention_forward_kernel_d64(
      */
 
     constexpr int kQueryElements =
-        kQueryTileSize * kHeadDimension;
+        kKernelQueryTileSize * kHeadDimension;
 
     for (
         int element = thread_id;
         element < kQueryElements;
-        element += kThreadsPerBlock
+        element += kKernelThreadsPerBlock
     ) {
         const int local_query_row =
             element / kHeadDimension;
@@ -533,7 +550,8 @@ __global__ void tensorcore_attention_forward_kernel_d64(
             0,
             tensor_base,
             kSharedHeadStride,
-            thread_id
+            thread_id,
+            kKernelThreadsPerBlock
         );
         stage_tile_async_16<kKeyTileSize>(
             &value_shared[0][0],
@@ -541,7 +559,8 @@ __global__ void tensorcore_attention_forward_kernel_d64(
             0,
             tensor_base,
             kSharedHeadStride,
-            thread_id
+            thread_id,
+            kKernelThreadsPerBlock
         );
 
         commit_async_copy_group();
@@ -588,7 +607,8 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                     next_key_tile_start,
                     tensor_base,
                     kSharedHeadStride,
-                    thread_id
+                    thread_id,
+                    kKernelThreadsPerBlock
                 );
 
                 commit_async_copy_group();
@@ -605,7 +625,8 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                     key_tile_start,
                     tensor_base,
                     kSharedHeadStride,
-                    thread_id
+                    thread_id,
+                    kKernelThreadsPerBlock
                 );
 
                 stage_tile_async_16<kKeyTileSize>(
@@ -614,7 +635,8 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                     key_tile_start,
                     tensor_base,
                     kSharedHeadStride,
-                    thread_id
+                    thread_id,
+                    kKernelThreadsPerBlock
                 );
 
                 commit_async_copy_group();
@@ -1011,6 +1033,44 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
         __syncwarp(kFullWarpMask);
 
+        if constexpr(kUseRawPv && kUseRawQk){
+            /*
+            Tile 0's V was fully loaded in the pipeline
+            Later V tiles are launched async at the 
+            bottom of the previous iteration
+            */
+
+            if(key_tile_start > 0){
+                if(has_next_tile){
+                    /*
+                    Outstanding groups:
+
+                    older: V[current]
+                    newer: K[next]
+
+                    Wait until only the newest group may remain.
+                    Therefore V[current] is ready while K[next]
+                    may continue transferring during PV.
+                    */
+
+                    wait_for_async_copy_group_1();
+                }else{
+                    /*
+                    Last tile:
+
+                    There is no K[next], so V[current] is the 
+                    only outstanding group. wait_group 1 would 
+                    be allowed to leave it outstanding.
+                   
+                    */
+
+                    wait_for_async_copy_group();
+
+                }
+                __syncthreads();
+            }
+        }
+
 
         /*
          * PV
@@ -1323,39 +1383,40 @@ __global__ void tensorcore_attention_forward_kernel_d64(
     current Qk/softmax/PV work.
     */
 
-    __syncthreads();
-    if constexpr(kUseRawQk && kUseRawPv){
-        if(has_next_tile){
-            /*
-            K[next] must be complete before the next
-            iteration consumes its k stage.
-            */
+   __syncthreads();
 
+    if constexpr (kUseRawQk && kUseRawPv) {
+        if (has_next_tile) {
+
+            /*
+            * K[next] has been moving during current compute.
+            * Finish it before the next iteration uses it.
+            */
             wait_for_async_copy_group();
 
             /*
-            V has only one buffer, so V[next] cannot be
-            loaded until every warp has finished PV[current].
+            * K[next] was cooperatively loaded by the CTA.
+            * Make it visible to all consumers.
             */
+            __syncthreads();
 
+            /*
+            * Start V[next], but DO NOT wait for it.
+            *
+            * It will remain in flight as the next
+            * iteration starts QK + softmax.
+            */
             stage_tile_async_16<kKeyTileSize>(
                 &value_shared[0][0],
                 value,
                 next_key_tile_start,
                 tensor_base,
                 kSharedHeadStride,
-                thread_id
+                thread_id,
+                kKernelThreadsPerBlock
             );
 
             commit_async_copy_group();
-            wait_for_async_copy_group();
-
-            /*
-            Make V[next] visible to every warp before
-            starting the next iteration.
-            */
-
-            __syncthreads();
         }
     }
 }
@@ -1573,6 +1634,15 @@ torch::Tensor tensorcore_attention_forward_impl(
     torch::Tensor key,
     torch::Tensor value
 ) {
+
+    constexpr int kKernelWarpsPerBlock =
+    (kUseRawQk && kUseRawPv) ? 4 : kWarpsPerBlock;
+
+    constexpr int kKernelThreadsPerBlock =
+        kWarpSize * kKernelWarpsPerBlock;
+
+    constexpr int kKernelQueryTileSize =
+        kKernelWarpsPerBlock * kQueryRowsPerWarp;
     validate_tensorcore_attention_inputs<
         kKeyTileSize
     >(
@@ -1608,10 +1678,10 @@ torch::Tensor tensorcore_attention_forward_impl(
     const int64_t num_query_tiles =
         (
             sequence_length +
-            kQueryTileSize -
+            kKernelQueryTileSize -
             1
         ) /
-        kQueryTileSize;
+        kKernelQueryTileSize;
 
     const int64_t num_batch_heads =
         batch_size * num_heads;
@@ -1650,7 +1720,7 @@ torch::Tensor tensorcore_attention_forward_impl(
     );
 
     const dim3 block(
-        kThreadsPerBlock,
+        kKernelThreadsPerBlock,
         1,
         1
     );
