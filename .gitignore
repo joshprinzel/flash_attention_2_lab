@@ -75,3 +75,9 @@ Thumbs.db
 ncu/
 profiles/
 profiling/
+
+# Nsight / profiler text exports
+*_report.txt
+*_source.txt
+*_details.txt
+*_raw.csv
