@@ -447,13 +447,12 @@ __device__ __forceinline__ MmaOperandA make_probability_mma_a(
 }
 template<int kScoreSubtiles>
 __device__ __forceinline__
-void normalize_score_tile_and_make_probability(
+void normalize_score_tile_in_place(
     MmaAccumulator (&score_accumulators)[kScoreSubtiles],
     float scale,
     int lane_id,
     float& running_row_max,
     float& running_row_sum,
-    MmaOperandA (&probability_fragments)[kScoreSubtiles / 2],
     float& previous_scale_for_lane
 ) {
     static_assert(kScoreSubtiles % 2 == 0);
@@ -668,23 +667,6 @@ void normalize_score_tile_and_make_probability(
             previous_scale_for_lane *
                 running_row_sum +
             tile_row_sum;
-    }
-
-#pragma unroll
-    for (
-        int probability_fragment = 0;
-        probability_fragment < kScoreSubtiles / 2;
-        ++probability_fragment
-    ) {
-        probability_fragments[probability_fragment] =
-            make_probability_mma_a(
-                score_accumulators[
-                    probability_fragment * 2
-                ],
-                score_accumulators[
-                    probability_fragment * 2 + 1
-                ]
-            );
     }
 }
 template<int kKeyTileSize>
@@ -2146,20 +2128,14 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
      * Each lane owns 32 FP32 values for each
      * 16-row M slice.
      */
-    float first_output_accumulator[32];
-    float second_output_accumulator[32];
+    
+    MmaAccumulator first_output_accumulator[kProductionOutputSubtiles];
+    MmaAccumulator second_output_accumulator[kProductionOutputSubtiles];
 
-#pragma unroll
-    for (
-        int item = 0;
-        item < 32;
-        ++item
-    ) {
-        first_output_accumulator[item] =
-            0.0f;
-
-        second_output_accumulator[item] =
-            0.0f;
+    #pragma unroll
+    for(int output_subtile = 0; output_subtile < kProductionOutputSubtiles; ++output_subtile){
+        first_output_accumulator[output_subtile] = zero_mma_accumulator();
+        second_output_accumulator[output_subtile] = zero_mma_accumulator();
     }
 
 
@@ -2360,15 +2336,6 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
          * Therefore max/sum/rescaling happens once
          * for all 128 score columns.
          */
-        MmaOperandA
-            first_probability_fragments[
-                kProductionProbabilityFragments
-            ];
-
-        MmaOperandA
-            second_probability_fragments[
-                kProductionProbabilityFragments
-            ];
 
         float first_previous_scale_for_lane =
             0.0f;
@@ -2377,7 +2344,7 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
             0.0f;
 
 
-        normalize_score_tile_and_make_probability<
+        normalize_score_tile_in_place<
             kProductionScoreSubtiles
         >(
             first_score_accumulators,
@@ -2385,11 +2352,10 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
             lane_id,
             first_running_row_max,
             first_running_row_sum,
-            first_probability_fragments,
             first_previous_scale_for_lane
         );
 
-        normalize_score_tile_and_make_probability<
+        normalize_score_tile_in_place<
             kProductionScoreSubtiles
         >(
             second_score_accumulators,
@@ -2397,7 +2363,6 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
             lane_id,
             second_running_row_max,
             second_running_row_sum,
-            second_probability_fragments,
             second_previous_scale_for_lane
         );
 
@@ -2438,6 +2403,36 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
                     second_previous_scale_for_lane,
                     lower_output_row
                 );
+        
+        #pragma unroll
+        for(int output_subtile = 0; output_subtile < kProductionOutputSubtiles; ++output_subtile){
+            #pragma unroll 
+            for(int register_index = 0; register_index < 4; ++register_index){
+                const bool is_upper_row = register_index < 2;
+
+                const float first_previous_scale = is_upper_row ? first_upper_previous_scale : first_lower_previous_scale;
+                const float second_previous_scale = is_upper_row ? second_upper_previous_scale : second_lower_previous_scale;
+
+                first_output_accumulator[output_subtile].registers[register_index] *= first_previous_scale;
+                second_output_accumulator[output_subtile].registers[register_index] *= second_previous_scale;
+            }
+        }
+
+        MmaOperandA first_probability_fragments[kProductionProbabilityFragments];
+        MmaOperandA second_probability_fragments[kProductionProbabilityFragments];
+
+        #pragma unroll
+        for(int probability_fragment = 0; probability_fragment < kProductionProbabilityFragments; ++probability_fragment){
+            first_probability_fragments[probability_fragment] = make_probability_mma_a(
+                first_score_accumulators[probability_fragment*2],
+                first_score_accumulators[probability_fragment*2 + 1]
+            );
+
+            second_probability_fragments[probability_fragment] = make_probability_mma_a(
+                second_score_accumulators[probability_fragment * 2],
+                second_score_accumulators[probability_fragment * 2 + 1]
+            );
+        }
 
 
         /*
@@ -2460,14 +2455,6 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
                 output_subtile *
                 kProductionRawMmaOutputColumns;
 
-            MmaAccumulator
-                first_pv_accumulator =
-                    zero_mma_accumulator();
-
-            MmaAccumulator
-                second_pv_accumulator =
-                    zero_mma_accumulator();
-
 
 #pragma unroll
             for (
@@ -2489,7 +2476,7 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
                         );
 
                 mma_m16n8k16_f16_f32(
-                    first_pv_accumulator,
+                    first_output_accumulator[output_subtile],
                     first_probability_fragments[
                         reduction_subtile
                     ],
@@ -2497,64 +2484,12 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
                 );
 
                 mma_m16n8k16_f16_f32(
-                    second_pv_accumulator,
+                    second_output_accumulator[output_subtile],
                     second_probability_fragments[
                         reduction_subtile
                     ],
                     value_fragment
                 );
-            }
-
-
-            /*
-             * Merge this physical 128-column tile's
-             * contribution into the persistent online
-             * output numerator.
-             */
-#pragma unroll
-            for (
-                int register_index = 0;
-                register_index < 4;
-                ++register_index
-            ) {
-                const int accumulator_index =
-                    output_subtile * 4 +
-                    register_index;
-
-                const bool is_upper_row =
-                    register_index < 2;
-
-                const float first_previous_scale =
-                    is_upper_row
-                        ? first_upper_previous_scale
-                        : first_lower_previous_scale;
-
-                const float second_previous_scale =
-                    is_upper_row
-                        ? second_upper_previous_scale
-                        : second_lower_previous_scale;
-
-                first_output_accumulator[
-                    accumulator_index
-                ] =
-                    first_previous_scale *
-                        first_output_accumulator[
-                            accumulator_index
-                        ] +
-                    first_pv_accumulator.registers[
-                        register_index
-                    ];
-
-                second_output_accumulator[
-                    accumulator_index
-                ] =
-                    second_previous_scale *
-                        second_output_accumulator[
-                            accumulator_index
-                        ] +
-                    second_pv_accumulator.registers[
-                        register_index
-                    ];
             }
         }
 
@@ -2566,6 +2501,14 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
          */
         __syncthreads();
     }
+
+    /*
+    K/V dead after the final KV iteration.
+    Reuse the 128x64 V shared tile as the output
+    epilogue scratch buffer
+    */
+
+    half* output_shared = &value_shared[0][0];
 
 
     /*
@@ -2602,148 +2545,125 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
             second_running_row_sum,
             lower_output_row
         );
-
-
+    
     /*
-     * Existing half2 epilogue.
-     *
-     * We intentionally leave the production-quality
-     * O transpose/coalesced epilogue for the next
-     * independent optimization.
-     */
-#pragma unroll
-    for (
-        int output_subtile = 0;
-        output_subtile <
-            kProductionOutputSubtiles;
-        ++output_subtile
-    ) {
+    Production-style output
 
-#pragma unroll
-        for (
-            int register_pair = 0;
-            register_pair < 2;
-            ++register_pair
-        ) {
-            const int register_index =
-                register_pair * 2;
+    Phase 1:
+        Normalize MMa-owned FP32 output regs,
+        convert to FP16, and scatter them into the
+        reusable 128x64 shared tile
 
-            const int local_row =
-                mma_accumulator_row(
-                    lane_id,
-                    register_index
-                );
+    The scratch tile uses the same 8-half XOR 
+    swizzle as Q/K/V:
 
-            const int dimension =
-                output_subtile *
-                    kProductionRawMmaOutputColumns +
+        physical_chunk = logical_chunk ^ (row & 7)
+    
+    This converts awkward MMA register ownership
+    into a complete logical output tile
+    */
+
+    #pragma unroll
+    for(int output_subtile = 0; output_subtile < kProductionOutputSubtiles; ++output_subtile){
+        #pragma unroll
+        for(int register_pair = 0; register_pair < 2; ++register_pair){
+            const int register_index = register_pair * 2;
+
+            const int local_row = mma_accumulator_row(
+                lane_id,
+                register_index
+            );
+            const int logical_dimension = output_subtile * kProductionRawMmaOutputColumns +
                 mma_accumulator_column(
                     lane_id,
                     register_index
                 );
-
-            const int accumulator_index =
-                output_subtile * 4 +
-                register_index;
-
-            const bool is_upper_row =
-                register_index < 2;
-
-            const float first_inverse_sum =
-                is_upper_row
-                    ? first_upper_inverse_sum
-                    : first_lower_inverse_sum;
-
-            const float second_inverse_sum =
-                is_upper_row
-                    ? second_upper_inverse_sum
-                    : second_lower_inverse_sum;
+            
+            const bool is_upper_row = register_index < 2;
+            const float first_inverse_sum = is_upper_row ? first_upper_inverse_sum : first_lower_inverse_sum;
+            const float second_inverse_sum = is_upper_row ? second_upper_inverse_sum : second_lower_inverse_sum;
 
 
             /*
-             * First 16-row M slice.
-             */
-            const int64_t first_global_query_row =
-                query_tile_start +
-                first_query_row +
-                local_row;
+            First M Slice
+            */
 
-            if (
-                first_global_query_row <
-                sequence_length
-            ) {
-                const float first_value =
-                    first_output_accumulator[
-                        accumulator_index
-                    ] *
-                    first_inverse_sum;
+            {
+                const int output_row = first_query_row + local_row;
+                
+                const float first_value = first_output_accumulator[output_subtile].registers[register_index] * first_inverse_sum;
+                const float second_value = first_output_accumulator[output_subtile].registers[register_index + 1] * first_inverse_sum;
 
-                const float second_value =
-                    first_output_accumulator[
-                        accumulator_index + 1
-                    ] *
-                    first_inverse_sum;
+                const half2 packed_output = __floats2half2_rn(first_value, second_value);
 
-                const half2 packed_output =
-                    __floats2half2_rn(
-                        first_value,
-                        second_value
-                    );
+                const int logical_chunk = logical_dimension >> 3;
+                const int physical_chunk = logical_chunk ^ (output_row & 7);
 
-                const int64_t global_index =
-                    tensor_base +
-                    first_global_query_row *
-                        kHeadDimension +
-                    dimension;
+                const int physical_dimension = (physical_chunk << 3) + (logical_dimension & 7);
 
-                *reinterpret_cast<half2*>(
-                    &output[global_index]
-                ) =
-                    packed_output;
+                *reinterpret_cast<half2*>(&output_shared[(output_row << 6) + physical_dimension]) = packed_output;
             }
-
-
             /*
-             * Second 16-row M slice.
-             */
-            const int64_t second_global_query_row =
-                query_tile_start +
-                second_query_row +
-                local_row;
+            Second M Slice
+            */
+            {
+                const int output_row = second_query_row + local_row;
+                
+                const float first_value = second_output_accumulator[output_subtile].registers[register_index] * second_inverse_sum;
+                const float second_value = second_output_accumulator[output_subtile].registers[register_index + 1] * second_inverse_sum;
 
-            if (
-                second_global_query_row <
-                sequence_length
-            ) {
-                const float first_value =
-                    second_output_accumulator[
-                        accumulator_index
-                    ] *
-                    second_inverse_sum;
+                const half2 packed_output = __floats2half2_rn(first_value, second_value);
 
-                const float second_value =
-                    second_output_accumulator[
-                        accumulator_index + 1
-                    ] *
-                    second_inverse_sum;
+                const int logical_chunk = logical_dimension >> 3;
+                const int physical_chunk = logical_chunk ^ (output_row & 7);
 
-                const half2 packed_output =
-                    __floats2half2_rn(
-                        first_value,
-                        second_value
-                    );
+                const int physical_dimension = (physical_chunk << 3) + (logical_dimension & 7);
 
-                const int64_t global_index =
-                    tensor_base +
-                    second_global_query_row *
-                        kHeadDimension +
-                    dimension;
-
-                *reinterpret_cast<half2*>(
-                    &output[global_index]
-                ) =
-                    packed_output;
+                *reinterpret_cast<half2*>(&output_shared[(output_row << 6) + physical_dimension]) = packed_output;
             }
+        }
+    }
+
+    __syncthreads();
+
+    /*
+    * Phase 2:
+    *
+    * Repartition ownership for global memory.
+    *
+    * One warp writes one complete logical output
+    * row at a time:
+    *
+    *   lane  0 -> cols  0..1
+    *   lane  1 -> cols  2..3
+    *   ...
+    *   lane 31 -> cols 62..63
+    *
+    * Therefore the warp collectively writes one
+    * contiguous 128-byte output row.
+    *
+    * Four warps process four rows concurrently;
+    * 32 iterations cover all 128 rows.
+    */
+
+    #pragma unroll
+    for(int row_iteration = 0; row_iteration < kProductionBlockM / kProductionWarpsPerBlock; row_iteration++){
+        const int output_row = row_iteration * kProductionWarpsPerBlock + warp_id;
+
+        const int logical_dimension = lane_id * 2;
+        const int logical_chunk = logical_dimension >> 3;
+
+        const int physical_chunk = logical_chunk ^ (output_row & 7);
+        const int physical_dimension = (physical_chunk << 3) + (logical_dimension & 7);
+
+        const half2 packed_output = *reinterpret_cast<const half2*>(&output_shared[(output_row << 6) + physical_dimension]);
+
+        const int64_t global_query_row = query_tile_start + output_row;
+
+        if(global_query_row < sequence_length){
+            const int64_t global_index = tensor_base + global_query_row * kHeadDimension + logical_dimension;
+
+            *reinterpret_cast<half2*>(&output[global_index]) = packed_output;
         }
     }
 }
