@@ -109,13 +109,13 @@ def tensorcore_attention_bc32_raw_qk_raw_pv(
         )
     )
 
-def tensorcore_attention_production_128x64(
+def tensorcore_attention_production_128x128(
     inputs: AttentionInputs,
     workload: AttentionWorkload,
 ) -> Tensor:
     return (
         flash_attention_cuda
-        .tensorcore_attention_forward_production_128x64(
+        .tensorcore_attention_forward_production_128x128(
             inputs.query,
             inputs.key,
             inputs.value,
@@ -227,8 +227,8 @@ KERNELS = [
         ),
     ),
     KernelSpec(
-        name="tensorcore_production_128x64",
-        function=tensorcore_attention_production_128x64,
+        name="tensorcore_production_128x128",
+        function=tensorcore_attention_production_128x128,
         supported=lambda workload: (
             workload.dtype == torch.float16
             and workload.query_length == workload.key_length

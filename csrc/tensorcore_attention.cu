@@ -42,7 +42,7 @@ BlockM=128 with four warps
 */
 
 constexpr int kProductionBlockM = 128;
-constexpr int kProductionBlockN = 64;
+constexpr int kProductionBlockN = 128;
 
 constexpr int kProductionWarpsPerBlock = 4;
 constexpr int kProductionThreadsPerBlock = kProductionWarpsPerBlock * kWarpSize;
@@ -319,6 +319,62 @@ MmaOperandB load_mma_b_k_transpose_from_swizzled_row_major(
     return fragment;
 }
 
+__device__ __forceinline__
+MmaOperandA load_mma_a_from_swizzled_row_major_64(
+    const half* matrix,
+    int query_row_offset,
+    int dimension_offset
+) {
+    const int lane_id =
+        static_cast<int>(threadIdx.x) & 31;
+
+    const int matrix_index =
+        lane_id >> 3;
+
+    const int row_within_matrix =
+        lane_id & 7;
+
+    const int row_offset =
+        (matrix_index & 1) * 8 +
+        row_within_matrix;
+
+    const int column_offset =
+        (matrix_index >> 1) * 8;
+
+    const int logical_row =
+        query_row_offset +
+        row_offset;
+
+    const int logical_chunk =
+        (dimension_offset + column_offset) >> 3;
+
+    const int physical_chunk =
+        logical_chunk ^
+        (logical_row & 7);
+
+    const int half_offset =
+        (logical_row << 6) +
+        (physical_chunk << 3);
+
+    const uint32_t address =
+        shared_address(
+            matrix + half_offset
+        );
+
+    MmaOperandA fragment;
+
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+        "{%0, %1, %2, %3}, [%4];\n"
+        : "=r"(fragment.registers[0]),
+          "=r"(fragment.registers[1]),
+          "=r"(fragment.registers[2]),
+          "=r"(fragment.registers[3])
+        : "r"(address)
+    );
+
+    return fragment;
+}
 __device__ __forceinline__
 void mma_m16n8k16_f16_f32(
     MmaAccumulator& accumulator,
@@ -1948,7 +2004,6 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
 }
 
-
 __global__ void tensorcore_attention_forward_kernel_d64_production(
     const half* __restrict__ query,
     const half* __restrict__ key,
@@ -1980,24 +2035,26 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
 
 
     /*
-     * Shared memory.
+     * 128x128x64 production tile.
      *
-     * Q keeps the known-good padded layout.
-     * K/V use compact 64-wide XOR-swizzled layouts.
+     * Q = 16 KiB
+     * K = 16 KiB
+     * V = 16 KiB
+     *
+     * Total static shared = 48 KiB.
+     *
+     * All three operands use the compact
+     * 64-wide XOR-swizzled shared layout.
      */
-    constexpr int kProductionQuerySharedStride =
-        kHeadDimension + 8;
-
-    __shared__ __align__(32)
+    __shared__ __align__(128)
     half query_shared[
         kProductionBlockM
     ][
-        kProductionQuerySharedStride
+        kHeadDimension
     ];
 
     __shared__ __align__(128)
-    half key_shared
-    [
+    half key_shared[
         kProductionBlockN
     ][
         kHeadDimension
@@ -2029,75 +2086,53 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
 
 
     /*
-     * Stage the 128 x 64 Q tile once.
+     * Stage the entire 128x64 Q tile once.
      *
-     * Q is reused across every K/V tile.
+     * Current production path assumes sequence
+     * length is divisible by 128, so every Q tile
+     * is complete.
      */
-    constexpr int kProductionQueryElements =
-        kProductionBlockM *
-        kHeadDimension;
+    stage_tile_async_16_swizzled_64<
+        kProductionBlockM
+    >(
+        &query_shared[0][0],
+        query,
+        query_tile_start,
+        tensor_base,
+        thread_id,
+        kProductionThreadsPerBlock
+    );
 
-    for (
-        int element = thread_id;
-        element < kProductionQueryElements;
-        element += kProductionThreadsPerBlock
-    ) {
-        const int local_query_row =
-            element / kHeadDimension;
-
-        const int dimension =
-            element % kHeadDimension;
-
-        const int64_t global_query_row =
-            query_tile_start +
-            local_query_row;
-
-        if (
-            global_query_row <
-            sequence_length
-        ) {
-            const int64_t global_index =
-                tensor_base +
-                global_query_row *
-                    kHeadDimension +
-                dimension;
-
-            query_shared[
-                local_query_row
-            ][
-                dimension
-            ] = query[global_index];
-        } else {
-            query_shared[
-                local_query_row
-            ][
-                dimension
-            ] = __float2half_rn(0.0f);
-        }
-    }
+    commit_async_copy_group();
+    wait_for_async_copy_group();
 
     __syncthreads();
 
 
     /*
-     * MMA tile geometry.
+     * Full 128-column score geometry.
+     *
+     * 16 x m16n8 score fragments cover N=128.
+     * 8 x 16-column probability fragments cover
+     * the PV reduction dimension.
      */
     constexpr int kProductionRawMmaOutputColumns =
         8;
 
-    constexpr int kProductionComputeBlockN = 32;
-
     constexpr int kProductionScoreSubtiles =
-        kProductionComputeBlockN /
-        kProductionRawMmaOutputColumns;   // 4
+        kProductionBlockN /
+        kProductionRawMmaOutputColumns;
+    // 16
 
     constexpr int kProductionOutputSubtiles =
         kHeadDimension /
-        kProductionRawMmaOutputColumns;  // 8
+        kProductionRawMmaOutputColumns;
+    // 8
 
     constexpr int kProductionProbabilityFragments =
-        kProductionComputeBlockN /
-        kMmaK;                           // 2
+        kProductionBlockN /
+        kMmaK;
+    // 8
 
     static_assert(
         kProductionScoreSubtiles ==
@@ -2108,7 +2143,8 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
     /*
      * Persistent FP32 output numerators.
      *
-     * These survive across every K/V tile.
+     * Each lane owns 32 FP32 values for each
+     * 16-row M slice.
      */
     float first_output_accumulator[32];
     float second_output_accumulator[32];
@@ -2128,10 +2164,10 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
 
 
     /*
-     * Independent online-softmax state for
-     * the two M slices owned by this warp.
+     * Independent online-softmax state for the
+     * two 16-row slices owned by this warp.
      *
-     * Lanes 0..15 own the row-level state.
+     * Lanes 0..15 own row-level max/sum state.
      */
     float first_running_row_max =
         -CUDART_INF_F;
@@ -2147,8 +2183,11 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
 
 
     /*
-     * MMA accumulator row ownership is invariant
-     * across output D subtiles.
+     * MMA accumulator row ownership.
+     *
+     * Registers 0/1 correspond to one row from
+     * lanes 0..7. Registers 2/3 correspond to
+     * the row eight positions below it.
      */
     const int upper_output_row =
         lane_id >> 2;
@@ -2158,19 +2197,16 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
 
 
     /*
-     * Stream through all K/V tiles.
+     * Stream through physical K/V tiles of 128 rows.
      *
-     * This is deliberately sequential for 9A:
+     * Each iteration performs:
      *
-     * stage K/V
-     *   -> wait/barrier
-     *   -> QK
-     *   -> online softmax
-     *   -> PV
-     *   -> persistent O update
-     *   -> barrier
+     *   QK over all 128 K rows
+     *   one online-softmax update over 128 scores
+     *   PV over all 128 probability values
+     *   one persistent O update
      *
-     * Pipelining comes after correctness.
+     * No 32-column compute-window approximation.
      */
     for (
         int64_t key_tile_start = 0;
@@ -2179,9 +2215,8 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
     ) {
 
         /*
-         * Stage current K/V tile.
+         * Stage the full 128x64 K/V tiles.
          */
-
         stage_tile_async_16_swizzled_64<
             kProductionBlockN
         >(
@@ -2207,330 +2242,334 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
         commit_async_copy_group();
         wait_for_async_copy_group();
 
-        __syncthreads();    
+        __syncthreads();
 
 
-        #pragma unroll 1
-        for(int key_chunk_offset = 0; key_chunk_offset < kProductionBlockN; key_chunk_offset += kProductionComputeBlockN){
-            /*
-            * Fresh QK score state for this K tile.
-            */
-            MmaAccumulator
-                first_score_accumulators[
-                    kProductionScoreSubtiles
-                ];
+        /*
+         * Full 128-column QK score state.
+         *
+         * Two independent score banks because each
+         * warp owns two 16-row Q slices.
+         */
+        MmaAccumulator
+            first_score_accumulators[
+                kProductionScoreSubtiles
+            ];
 
-            MmaAccumulator
-                second_score_accumulators[
-                    kProductionScoreSubtiles
-                ];
+        MmaAccumulator
+            second_score_accumulators[
+                kProductionScoreSubtiles
+            ];
 
-    #pragma unroll
+
+#pragma unroll
+        for (
+            int score_subtile = 0;
+            score_subtile <
+                kProductionScoreSubtiles;
+            ++score_subtile
+        ) {
+            first_score_accumulators[
+                score_subtile
+            ] =
+                zero_mma_accumulator();
+
+            second_score_accumulators[
+                score_subtile
+            ] =
+                zero_mma_accumulator();
+        }
+
+
+        /*
+         * QK^T.
+         *
+         * Q fragments are reused across all 16
+         * N subtiles for a given K=16 dimension.
+         *
+         * Each K fragment is reused across both
+         * M slices.
+         */
+#pragma unroll
+        for (
+            int dimension_offset = 0;
+            dimension_offset < kHeadDimension;
+            dimension_offset += kMmaK
+        ) {
+            const MmaOperandA
+                first_query_fragment =
+                    load_mma_a_from_swizzled_row_major_64(
+                        &query_shared[0][0],
+                        first_query_row,
+                        dimension_offset
+                    );
+
+            const MmaOperandA
+                second_query_fragment =
+                    load_mma_a_from_swizzled_row_major_64(
+                        &query_shared[0][0],
+                        second_query_row,
+                        dimension_offset
+                    );
+
+
+#pragma unroll
             for (
                 int score_subtile = 0;
                 score_subtile <
                     kProductionScoreSubtiles;
                 ++score_subtile
             ) {
-                first_score_accumulators[
-                    score_subtile
-                ] = zero_mma_accumulator();
+                const int key_offset =
+                    score_subtile *
+                    kProductionRawMmaOutputColumns;
 
-                second_score_accumulators[
-                    score_subtile
-                ] = zero_mma_accumulator();
-            }
-
-
-            /*
-            * QK^T.
-            *
-            * One K fragment is reused by both
-            * M slices owned by the warp.
-            */
-    #pragma unroll
-            for (
-                int dimension_offset = 0;
-                dimension_offset <
-                    kHeadDimension;
-                dimension_offset += kMmaK
-            ) {
-                const half* first_query_tile =
-                    &query_shared[
-                        first_query_row
-                    ][
-                        dimension_offset
-                    ];
-
-                const half* second_query_tile =
-                    &query_shared[
-                        second_query_row
-                    ][
-                        dimension_offset
-                    ];
-
-                const MmaOperandA
-                    first_query_fragment =
-                        load_mma_a_row_major(
-                            first_query_tile,
-                            kProductionQuerySharedStride
-                        );
-
-                const MmaOperandA
-                    second_query_fragment =
-                        load_mma_a_row_major(
-                            second_query_tile,
-                            kProductionQuerySharedStride
-                        );
-
-    #pragma unroll
-                for (
-                    int score_subtile = 0;
-                    score_subtile <
-                        kProductionScoreSubtiles;
-                    ++score_subtile
-                ) {
-                    const int key_offset =
-                        key_chunk_offset +
-                        score_subtile *
-                            kProductionRawMmaOutputColumns;
-
-                    const MmaOperandB key_fragment =
+                const MmaOperandB
+                    key_fragment =
                         load_mma_b_k_transpose_from_swizzled_row_major(
                             &key_shared[0][0],
                             key_offset,
                             dimension_offset
                         );
 
-                    mma_m16n8k16_f16_f32(
-                        first_score_accumulators[
-                            score_subtile
-                        ],
-                        first_query_fragment,
-                        key_fragment
-                    );
+                mma_m16n8k16_f16_f32(
+                    first_score_accumulators[
+                        score_subtile
+                    ],
+                    first_query_fragment,
+                    key_fragment
+                );
 
-                    mma_m16n8k16_f16_f32(
-                        second_score_accumulators[
-                            score_subtile
-                        ],
-                        second_query_fragment,
-                        key_fragment
-                    );
-                }
+                mma_m16n8k16_f16_f32(
+                    second_score_accumulators[
+                        score_subtile
+                    ],
+                    second_query_fragment,
+                    key_fragment
+                );
             }
-
-
-            /*
-            * Independent online softmax for the
-            * two M slices.
-            *
-            * Scores are converted directly into
-            * P MMA operands.
-            */
-            MmaOperandA first_probability_fragments[kProductionProbabilityFragments];
-            MmaOperandA second_probability_fragments[kProductionProbabilityFragments];
-
-            float first_previous_scale_for_lane =
-                0.0f;
-
-            float second_previous_scale_for_lane =
-                0.0f;
-
-            normalize_score_tile_and_make_probability<
-                kProductionScoreSubtiles
-            >(
-                first_score_accumulators,
-                scale,
-                lane_id,
-                first_running_row_max,
-                first_running_row_sum,
-                first_probability_fragments,
-                first_previous_scale_for_lane
-            );
-
-            normalize_score_tile_and_make_probability<
-                kProductionScoreSubtiles
-            >(
-                second_score_accumulators,
-                scale,
-                lane_id,
-                second_running_row_max,
-                second_running_row_sum,
-                second_probability_fragments,
-                second_previous_scale_for_lane
-            );
-
-            
-
-
-            /*
-            * Broadcast each row's old-output rescale
-            * factor to the lanes that own that row's
-            * PV accumulator registers.
-            */
-            const float
-                first_upper_previous_scale =
-                    __shfl_sync(
-                        kFullWarpMask,
-                        first_previous_scale_for_lane,
-                        upper_output_row
-                    );
-
-            const float
-                first_lower_previous_scale =
-                    __shfl_sync(
-                        kFullWarpMask,
-                        first_previous_scale_for_lane,
-                        lower_output_row
-                    );
-
-            const float
-                second_upper_previous_scale =
-                    __shfl_sync(
-                        kFullWarpMask,
-                        second_previous_scale_for_lane,
-                        upper_output_row
-                    );
-
-            const float
-                second_lower_previous_scale =
-                    __shfl_sync(
-                        kFullWarpMask,
-                        second_previous_scale_for_lane,
-                        lower_output_row
-                    );
-
-
-            /*
-            * PV.
-            *
-            * One V fragment is reused by both
-            * independent M slices.
-            */
-    #pragma unroll
-            for (
-                int output_subtile = 0;
-                output_subtile <
-                    kProductionOutputSubtiles;
-                ++output_subtile
-            ) {
-                const int
-                    output_dimension_offset =
-                        output_subtile *
-                        kProductionRawMmaOutputColumns;
-
-                MmaAccumulator
-                    first_pv_accumulator =
-                        zero_mma_accumulator();
-
-                MmaAccumulator
-                    second_pv_accumulator =
-                        zero_mma_accumulator();
-
-
-    #pragma unroll
-                for (
-                    int reduction_subtile = 0;
-                    reduction_subtile < kProductionProbabilityFragments;
-                    ++reduction_subtile
-                ) {
-                    const int reduction_offset =
-                        key_chunk_offset +
-                        reduction_subtile *
-                            kMmaK;
-
-                    const MmaOperandB
-                        value_fragment =
-                            load_mma_b_col_major_from_swizzled_value(
-                                &value_shared[0][0],
-                                reduction_offset,
-                                output_dimension_offset
-                            );
-
-                    mma_m16n8k16_f16_f32(
-                        first_pv_accumulator,
-                        first_probability_fragments[
-                            reduction_subtile
-                        ],
-                        value_fragment
-                    );
-
-                    mma_m16n8k16_f16_f32(
-                        second_pv_accumulator,
-                        second_probability_fragments[
-                            reduction_subtile
-                        ],
-                        value_fragment
-                    );
-                }
-
-
-                /*
-                * Merge this tile's PV contribution into
-                * the persistent online numerator.
-                */
-    #pragma unroll
-                for (
-                    int register_index = 0;
-                    register_index < 4;
-                    ++register_index
-                ) {
-                    const int accumulator_index =
-                        output_subtile * 4 +
-                        register_index;
-
-                    const bool is_upper_row =
-                        register_index < 2;
-
-                    const float first_previous_scale =
-                        is_upper_row
-                            ? first_upper_previous_scale
-                            : first_lower_previous_scale;
-
-                    const float second_previous_scale =
-                        is_upper_row
-                            ? second_upper_previous_scale
-                            : second_lower_previous_scale;
-
-                    first_output_accumulator[
-                        accumulator_index
-                    ] =
-                        first_previous_scale *
-                            first_output_accumulator[
-                                accumulator_index
-                            ] +
-                        first_pv_accumulator.registers[
-                            register_index
-                        ];
-
-                    second_output_accumulator[
-                        accumulator_index
-                    ] =
-                        second_previous_scale *
-                            second_output_accumulator[
-                                accumulator_index
-                            ] +
-                        second_pv_accumulator.registers[
-                            register_index
-                        ];
-                }
-            }
-
         }
 
 
         /*
-         * All warps must finish consuming the current
-         * K/V tile before shared memory is overwritten
-         * by the next iteration.
+         * Full 128-column online softmax.
+         *
+         * The helper now instantiates with
+         * kProductionScoreSubtiles == 16.
+         *
+         * Therefore max/sum/rescaling happens once
+         * for all 128 score columns.
+         */
+        MmaOperandA
+            first_probability_fragments[
+                kProductionProbabilityFragments
+            ];
+
+        MmaOperandA
+            second_probability_fragments[
+                kProductionProbabilityFragments
+            ];
+
+        float first_previous_scale_for_lane =
+            0.0f;
+
+        float second_previous_scale_for_lane =
+            0.0f;
+
+
+        normalize_score_tile_and_make_probability<
+            kProductionScoreSubtiles
+        >(
+            first_score_accumulators,
+            scale,
+            lane_id,
+            first_running_row_max,
+            first_running_row_sum,
+            first_probability_fragments,
+            first_previous_scale_for_lane
+        );
+
+        normalize_score_tile_and_make_probability<
+            kProductionScoreSubtiles
+        >(
+            second_score_accumulators,
+            scale,
+            lane_id,
+            second_running_row_max,
+            second_running_row_sum,
+            second_probability_fragments,
+            second_previous_scale_for_lane
+        );
+
+
+        /*
+         * Broadcast the online-rescale coefficient
+         * from each logical row owner to the lanes
+         * that own that row's output registers.
+         */
+        const float
+            first_upper_previous_scale =
+                __shfl_sync(
+                    kFullWarpMask,
+                    first_previous_scale_for_lane,
+                    upper_output_row
+                );
+
+        const float
+            first_lower_previous_scale =
+                __shfl_sync(
+                    kFullWarpMask,
+                    first_previous_scale_for_lane,
+                    lower_output_row
+                );
+
+        const float
+            second_upper_previous_scale =
+                __shfl_sync(
+                    kFullWarpMask,
+                    second_previous_scale_for_lane,
+                    upper_output_row
+                );
+
+        const float
+            second_lower_previous_scale =
+                __shfl_sync(
+                    kFullWarpMask,
+                    second_previous_scale_for_lane,
+                    lower_output_row
+                );
+
+
+        /*
+         * PV.
+         *
+         * For every 8-column output D subtile,
+         * reduce across all eight 16-row portions
+         * of the 128-wide probability tile.
+         *
+         * Each V fragment feeds both M slices.
+         */
+#pragma unroll
+        for (
+            int output_subtile = 0;
+            output_subtile <
+                kProductionOutputSubtiles;
+            ++output_subtile
+        ) {
+            const int output_dimension_offset =
+                output_subtile *
+                kProductionRawMmaOutputColumns;
+
+            MmaAccumulator
+                first_pv_accumulator =
+                    zero_mma_accumulator();
+
+            MmaAccumulator
+                second_pv_accumulator =
+                    zero_mma_accumulator();
+
+
+#pragma unroll
+            for (
+                int reduction_subtile = 0;
+                reduction_subtile <
+                    kProductionProbabilityFragments;
+                ++reduction_subtile
+            ) {
+                const int reduction_offset =
+                    reduction_subtile *
+                    kMmaK;
+
+                const MmaOperandB
+                    value_fragment =
+                        load_mma_b_col_major_from_swizzled_value(
+                            &value_shared[0][0],
+                            reduction_offset,
+                            output_dimension_offset
+                        );
+
+                mma_m16n8k16_f16_f32(
+                    first_pv_accumulator,
+                    first_probability_fragments[
+                        reduction_subtile
+                    ],
+                    value_fragment
+                );
+
+                mma_m16n8k16_f16_f32(
+                    second_pv_accumulator,
+                    second_probability_fragments[
+                        reduction_subtile
+                    ],
+                    value_fragment
+                );
+            }
+
+
+            /*
+             * Merge this physical 128-column tile's
+             * contribution into the persistent online
+             * output numerator.
+             */
+#pragma unroll
+            for (
+                int register_index = 0;
+                register_index < 4;
+                ++register_index
+            ) {
+                const int accumulator_index =
+                    output_subtile * 4 +
+                    register_index;
+
+                const bool is_upper_row =
+                    register_index < 2;
+
+                const float first_previous_scale =
+                    is_upper_row
+                        ? first_upper_previous_scale
+                        : first_lower_previous_scale;
+
+                const float second_previous_scale =
+                    is_upper_row
+                        ? second_upper_previous_scale
+                        : second_lower_previous_scale;
+
+                first_output_accumulator[
+                    accumulator_index
+                ] =
+                    first_previous_scale *
+                        first_output_accumulator[
+                            accumulator_index
+                        ] +
+                    first_pv_accumulator.registers[
+                        register_index
+                    ];
+
+                second_output_accumulator[
+                    accumulator_index
+                ] =
+                    second_previous_scale *
+                        second_output_accumulator[
+                            accumulator_index
+                        ] +
+                    second_pv_accumulator.registers[
+                        register_index
+                    ];
+            }
+        }
+
+
+        /*
+         * All warps must finish consuming this K/V
+         * tile before the next iteration overwrites
+         * shared memory.
          */
         __syncthreads();
     }
 
 
     /*
-     * Final softmax normalization.
+     * Final normalization.
      */
     const float first_upper_inverse_sum =
         1.0f /
@@ -2566,9 +2605,11 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
 
 
     /*
-     * FP32 -> FP16 half2 epilogue.
+     * Existing half2 epilogue.
      *
-     * Write both M slices owned by the warp.
+     * We intentionally leave the production-quality
+     * O transpose/coalesced epilogue for the next
+     * independent optimization.
      */
 #pragma unroll
     for (
@@ -2620,13 +2661,12 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
 
 
             /*
-             * First M slice.
+             * First 16-row M slice.
              */
-            const int64_t
-                first_global_query_row =
-                    query_tile_start +
-                    first_query_row +
-                    local_row;
+            const int64_t first_global_query_row =
+                query_tile_start +
+                first_query_row +
+                local_row;
 
             if (
                 first_global_query_row <
@@ -2658,18 +2698,18 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
 
                 *reinterpret_cast<half2*>(
                     &output[global_index]
-                ) = packed_output;
+                ) =
+                    packed_output;
             }
 
 
             /*
-             * Second M slice.
+             * Second 16-row M slice.
              */
-            const int64_t
-                second_global_query_row =
-                    query_tile_start +
-                    second_query_row +
-                    local_row;
+            const int64_t second_global_query_row =
+                query_tile_start +
+                second_query_row +
+                local_row;
 
             if (
                 second_global_query_row <
@@ -2701,11 +2741,14 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
 
                 *reinterpret_cast<half2*>(
                     &output[global_index]
-                ) = packed_output;
+                ) =
+                    packed_output;
             }
         }
     }
 }
+
+
 
 template <int kKeyTileSize>
 void validate_tensorcore_attention_inputs(
@@ -3149,7 +3192,7 @@ torch::Tensor tensorcore_attention_forward_bc32_raw_qk_raw_pv(
     );
 }
 
-torch::Tensor tensorcore_attention_forward_production_128x64(
+torch::Tensor tensorcore_attention_forward_production_128x128(
     torch::Tensor query,
     torch::Tensor key,
     torch::Tensor value

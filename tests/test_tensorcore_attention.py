@@ -301,14 +301,13 @@ def test_tensorcore_attention_bc32_raw_pv_matches_sdpa(
 @pytest.mark.parametrize(
     ("batch", "heads", "sequence_length"),
     [
-        (1, 1, 64),
         (1, 2, 128),
         (1, 4, 256),
         (1, 8, 512),
         (1, 8, 1024)
     ],
 )
-def test_tensorcore_attention_production_128x64_matches_sdpa(
+def test_tensorcore_attention_production_128x128_matches_sdpa(
     batch: int,
     heads: int,
     sequence_length: int,
@@ -353,7 +352,7 @@ def test_tensorcore_attention_production_128x64_matches_sdpa(
 
     actual = (
         flash_attention_cuda
-        .tensorcore_attention_forward_production_128x64(
+        .tensorcore_attention_forward_production_128x128(
             query,
             key,
             value,

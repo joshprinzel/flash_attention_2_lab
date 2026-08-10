@@ -60,7 +60,7 @@ torch::Tensor tensorcore_attention_forward_bc32_raw_qk_raw_pv(
     torch::Tensor value
 );
 
-torch::Tensor tensorcore_attention_forward_production_128x64(
+torch::Tensor tensorcore_attention_forward_production_128x128(
     torch::Tensor query,
     torch::Tensor key,
     torch::Tensor value
@@ -133,8 +133,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
     );
 
     module.def(
-        "tensorcore_attention_forward_production_128x64",
-        &tensorcore_attention_forward_production_128x64,
+        "tensorcore_attention_forward_production_128x128",
+        &tensorcore_attention_forward_production_128x128,
         "Production kernel"
     );
 }
