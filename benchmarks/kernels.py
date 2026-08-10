@@ -119,6 +119,7 @@ def tensorcore_attention_production_128x128(
             inputs.query,
             inputs.key,
             inputs.value,
+            workload.causal
         )
     )
 def pytorch_sdpa(
@@ -233,8 +234,8 @@ KERNELS = [
             workload.dtype == torch.float16
             and workload.query_length == workload.key_length
             and workload.head_dimension == 64
-            and workload.query_length % 32 == 0
-            and not workload.causal
+            and workload.query_length % 128 == 0
+            
         ),
     ),
 ]

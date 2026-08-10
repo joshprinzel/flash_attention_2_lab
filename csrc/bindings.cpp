@@ -63,7 +63,8 @@ torch::Tensor tensorcore_attention_forward_bc32_raw_qk_raw_pv(
 torch::Tensor tensorcore_attention_forward_production_128x128(
     torch::Tensor query,
     torch::Tensor key,
-    torch::Tensor value
+    torch::Tensor value,
+    bool causal
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){

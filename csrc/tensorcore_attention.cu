@@ -669,6 +669,36 @@ void normalize_score_tile_in_place(
             tile_row_sum;
     }
 }
+
+
+template<int kScoreSubtiles, int kColumnsPerSubtile>
+__device__ __forceinline__
+void apply_causal_mask_to_score_tile(
+    MmaAccumulator (&score_accumulators)[kScoreSubtiles],
+    int query_row_base,
+    int lane_id
+){
+    #pragma unroll
+    for(int score_subtile = 0; score_subtile < kScoreSubtiles; ++score_subtile){
+        #pragma unroll
+        for(int register_index = 0; register_index < 4; ++register_index){
+            const int query_row = query_row_base + mma_accumulator_row(lane_id, register_index);
+
+            const int key_column = score_subtile * kColumnsPerSubtile + mma_accumulator_column(
+                lane_id,
+                register_index
+            );
+
+            if(key_column > query_row){
+                score_accumulators[score_subtile].registers[register_index] = -CUDART_INF_F;
+            }
+        }
+    }
+
+}
+
+
+
 template<int kKeyTileSize>
 __device__ __forceinline__
 void stage_tile_async_16(
@@ -1986,6 +2016,7 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
 }
 
+template<bool kCausal>
 __global__ void tensorcore_attention_forward_kernel_d64_production(
     const half* __restrict__ query,
     const half* __restrict__ key,
@@ -2171,6 +2202,17 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
     const int lower_output_row =
         upper_output_row + 8;
 
+    
+    int64_t key_tile_end = sequence_length;
+
+    if constexpr(kCausal){
+        key_tile_end = query_tile_start + kProductionBlockM;
+
+        if(key_tile_end > sequence_length){
+            key_tile_end = sequence_length;
+        }
+    }
+
 
     /*
      * Stream through physical K/V tiles of 128 rows.
@@ -2186,7 +2228,7 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
      */
     for (
         int64_t key_tile_start = 0;
-        key_tile_start < sequence_length;
+        key_tile_start < key_tile_end;
         key_tile_start += kProductionBlockN
     ) {
 
@@ -2322,6 +2364,22 @@ __global__ void tensorcore_attention_forward_kernel_d64_production(
                     ],
                     second_query_fragment,
                     key_fragment
+                );
+            }
+        }
+
+        if constexpr(kCausal){
+            if(key_tile_start == query_tile_start){
+                apply_causal_mask_to_score_tile<kProductionScoreSubtiles, kProductionRawMmaOutputColumns>(
+                    first_score_accumulators,
+                    first_query_row,
+                    lane_id
+                );
+
+                apply_causal_mask_to_score_tile<kProductionScoreSubtiles, kProductionRawMmaOutputColumns>(
+                    second_score_accumulators,
+                    second_query_row,
+                    lane_id
                 );
             }
         }
@@ -2911,7 +2969,8 @@ torch::Tensor tensorcore_attention_forward_impl(
 torch::Tensor tensorcore_attention_forward_production_impl(
     torch::Tensor query,
     torch::Tensor key,
-    torch::Tensor value
+    torch::Tensor value,
+    bool causal
 ) {
     /*
      * 9A uses BlockN = 32, so K/V currently require
@@ -3027,19 +3086,36 @@ torch::Tensor tensorcore_attention_forward_production_impl(
             query.get_device()
         );
 
-    tensorcore_attention_forward_kernel_d64_production<<<
-        grid,
-        block,
-        0,
-        stream
-    >>>(
-        query_ptr,
-        key_ptr,
-        value_ptr,
-        output_ptr,
-        sequence_length,
-        scale
-    );
+    if(causal){
+        tensorcore_attention_forward_kernel_d64_production<true><<<
+            grid,
+            block,
+            0,
+            stream
+        >>>(
+            query_ptr,
+            key_ptr,
+            value_ptr,
+            output_ptr,
+            sequence_length,
+            scale
+        );
+
+    }else{
+        tensorcore_attention_forward_kernel_d64_production<false><<<
+            grid,
+            block,
+            0,
+            stream
+        >>>(
+            query_ptr,
+            key_ptr,
+            value_ptr,
+            output_ptr,
+            sequence_length,
+            scale
+        );
+    }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -3115,11 +3191,13 @@ torch::Tensor tensorcore_attention_forward_bc32_raw_qk_raw_pv(
 torch::Tensor tensorcore_attention_forward_production_128x128(
     torch::Tensor query,
     torch::Tensor key,
-    torch::Tensor value
+    torch::Tensor value,
+    bool causal
 ) {
     return tensorcore_attention_forward_production_impl(
         query,
         key,
-        value
+        value,
+        causal
     );
 }

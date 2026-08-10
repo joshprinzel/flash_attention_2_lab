@@ -2530,3 +2530,723 @@ profiling-driven resource decisions
 Experiment 8 therefore marks the end of optimizing the original tiled architecture.
 
 **Experiment 9 begins the production-style kernel redesign.**
+
+
+
+# Experiment 9 — Production 128×128 Kernel Redesign
+
+## Objective
+
+Experiment 9 moved the kernel from a sequence of isolated low-level optimizations into a **production-style FlashAttention forward-kernel architecture**.
+
+The Experiment 8 kernel had already established the core primitives:
+
+* raw `mma.sync` Tensor Core QK and PV
+* `ldmatrix` operand loading
+* XOR-swizzled shared memory
+* register-resident online softmax
+* `cp.async` staging
+* direct FP16 output
+* no intermediate probability shared-memory tile
+
+Its remaining limitation was architectural: the kernel still used a relatively small `64×32` attention tile. This required more KV-loop iterations, more repeated softmax bookkeeping, and more loop/synchronization overhead than a production FlashAttention-style geometry.
+
+Experiment 9 therefore focused on increasing tile size and redesigning the register, shared-memory, and epilogue schedules around a **128×128, four-warp kernel**.
+
+The goal was not simply to lower register count or increase occupancy. The goal was to reduce total work per output tile while maintaining efficient Tensor Core execution.
+
+---
+
+## Starting Point
+
+The strongest Experiment 8 kernel used:
+
+```text
+BlockM = 64
+BlockN = 32
+Warps  = 4
+D      = 64
+```
+
+Each warp owned one 16-row query slice and one `16×64` output tile.
+
+Representative latency at the target workload was approximately:
+
+```text
+B = 1
+H = 8
+N = 1024
+D = 64
+FP16
+noncausal
+
+Experiment 8:
+~0.076–0.077 ms
+```
+
+This became the baseline for the production redesign.
+
+---
+
+# Experiment 9A — 128×32
+
+The first step increased only the query tile:
+
+```text
+BlockM = 128
+BlockN = 32
+Warps  = 4
+```
+
+Each warp now owned two independent 16-row M slices:
+
+```text
+warp 0: rows  0–15 and 64–79
+warp 1: rows 16–31 and 80–95
+warp 2: rows 32–47 and 96–111
+warp 3: rows 48–63 and 112–127
+```
+
+Each slice maintained independent online-softmax state:
+
+```cpp
+float first_running_row_max;
+float first_running_row_sum;
+
+float second_running_row_max;
+float second_running_row_sum;
+```
+
+### Result
+
+```text
+Registers/thread: ~72
+Shared memory:    ~26.6 KiB
+Latency:          ~0.0786 ms
+```
+
+Despite the relatively low register footprint, the larger M tile did not improve latency.
+
+### Conclusion
+
+Increasing `BlockM` alone was insufficient.
+
+The kernel was still processing the K dimension in 32-column tiles, so the number of KV iterations and repeated softmax updates remained unchanged.
+
+This was the first indication that **register count was not the primary optimization target**. Reducing repeated work mattered more.
+
+---
+
+# Experiment 9B — 128×64
+
+The next design increased the physical KV tile:
+
+```text
+BlockM = 128
+BlockN = 64
+Warps  = 4
+```
+
+A naive full-score implementation created significant register pressure:
+
+```text
+~175 registers/thread
+~34.8 KiB shared memory
+```
+
+To reduce live score state, the 64-column tile was processed as two 32-column compute windows.
+
+Disabling unrolling of the outer score chunk loop reduced register usage further:
+
+```text
+~140 registers/thread
+```
+
+However, latency remained approximately:
+
+```text
+~0.0779 ms
+```
+
+### Conclusion
+
+The result exposed another important distinction:
+
+> A larger physical tile does not help much if the compute schedule still behaves like a sequence of smaller tiles.
+
+The chunked implementation still performed repeated softmax work over 32-column windows.
+
+The kernel therefore gained some resource efficiency without eliminating the structural overhead that motivated the redesign.
+
+This experiment was rejected.
+
+---
+
+# Experiment 9C — Full 128×128 Production Geometry
+
+The next step adopted the target production geometry directly:
+
+```text
+BlockM = 128
+BlockN = 128
+Warps  = 4
+HeadDim = 64
+```
+
+The shared-memory footprint became:
+
+```text
+Q: 128 × 64 × 2 B = 16 KiB
+K: 128 × 64 × 2 B = 16 KiB
+V: 128 × 64 × 2 B = 16 KiB
+
+Total = 48 KiB
+```
+
+Q, K, and V used XOR-swizzled row-major shared layouts compatible with custom `ldmatrix` loaders.
+
+Each warp still owned two independent 16-row M slices.
+
+For each M slice, the full 128-column score tile consisted of:
+
+```text
+16 × m16n8 score accumulator fragments
+```
+
+and the output tile consisted of:
+
+```text
+8 × m16n8 output accumulator fragments
+```
+
+The KV iteration now performed:
+
+```text
+1. stage K128 / V128
+2. full QK over 128 columns
+3. one online-softmax update
+4. convert normalized scores to eight FP16 P fragments
+5. P × V across eight k16 chunks
+6. update the persistent output
+```
+
+This removed much of the repeated softmax and loop overhead present in the smaller designs.
+
+### Initial Result
+
+```text
+Latency: ~0.0703 ms
+Registers/thread: 255
+Shared memory: 48 KiB
+```
+
+This was already a substantial improvement over the smaller-tile kernels.
+
+However, profiling exposed a serious new problem.
+
+The initial 128×128 kernel generated approximately:
+
+```text
+81,152 local-memory spill requests
+~41k local-load instructions
+~40k local-store instructions
+```
+
+while using the architectural maximum of 255 registers/thread.
+
+The kernel still ran quickly because much of the spill traffic was serviced by L1, but the register lifetime structure was clearly pathological.
+
+---
+
+# 9C.1 — Direct Persistent-O PV Accumulation
+
+The original PV implementation accumulated each P×V result into a temporary MMA accumulator before merging it into the persistent output accumulator.
+
+Conceptually:
+
+```text
+P × V
+  ↓
+temporary PV accumulator
+  ↓
+merge into O accumulator
+```
+
+This kept both the temporary PV result and the persistent output live simultaneously.
+
+The implementation was changed so that the persistent O fragment itself became the MMA accumulator:
+
+```text
+P × V + O → O
+```
+
+using the existing:
+
+```text
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+```
+
+instruction.
+
+The persistent state became:
+
+```cpp
+MmaAccumulator first_output_accumulator[8];
+MmaAccumulator second_output_accumulator[8];
+```
+
+and PV accumulated directly into these fragments.
+
+### PTXAS Result
+
+```text
+255 registers/thread
+0 B spill stores
+0 B spill loads
+48 KiB shared memory
+```
+
+### Benchmark Result
+
+```text
+~0.0702 ms
+```
+
+The large spill pathology disappeared, but latency changed very little.
+
+### Lesson
+
+This was an important profiler-driven result:
+
+> Eliminating a large amount of spill traffic does not necessarily produce a proportional latency improvement when that traffic is largely L1-resident and another execution resource dominates the kernel.
+
+The change was still retained because it simplified the dataflow and eliminated unnecessary transient state.
+
+---
+
+# 9C.2 — Score Normalization → O Rescale → P Conversion
+
+The next change targeted **peak register liveness**, rather than simply the nominal register count.
+
+The previous schedule effectively allowed normalized score values, packed P fragments, and O-rescale work to overlap in the compiler's dependency graph.
+
+The phases were separated into:
+
+```text
+QK
+↓
+normalize score fragments in-place
+↓
+broadcast previous softmax scale
+↓
+rescale persistent O
+↓
+convert normalized FP32 scores → packed FP16 P
+↓
+P × V directly into O
+```
+
+The desired register lifetime became:
+
+```text
+QK / softmax:
+    [O] [scores]
+
+PV:
+    [O] [P]
+```
+
+rather than keeping O, scores, and P temporaries simultaneously live.
+
+### PTXAS
+
+```text
+255 registers/thread
+8 B spill stores
+16 B spill loads
+```
+
+The compiler reintroduced a microscopic static spill, but runtime profiling showed that dynamic spilling had fallen dramatically.
+
+Compared with the original 128×128 implementation:
+
+```text
+spill requests:
+81,152 → 2,816
+```
+
+a reduction of approximately **96.5%**.
+
+The kernel also reduced its executed instruction count and improved Tensor Core utilization.
+
+### Benchmark
+
+```text
+~0.0683 ms
+```
+
+This was faster despite technically having a tiny PTXAS-reported spill.
+
+### Lesson
+
+This reinforced a key principle from the experiment:
+
+> Peak dependency structure and instruction scheduling can matter more than the compiler's headline register or spill count.
+
+The goal is not "zero spills at all costs." The goal is lower execution time.
+
+---
+
+# 9C.3 — Production-Style Shared-Memory Output Epilogue
+
+Profiling then exposed one remaining obvious memory-layout defect.
+
+The Tensor Core accumulator ownership pattern is designed for MMA execution, not for contiguous row-major global stores.
+
+The direct half2 epilogue therefore produced:
+
+```text
+Average global-store utilization:
+16 useful B / 32 B sector
+
+Global-store sectors:
+65,536
+
+Excessive sectors:
+32,768
+```
+
+Half of each global-memory sector was effectively wasted.
+
+The output epilogue was redesigned around a shared-memory ownership transformation.
+
+After the final KV iteration, `value_shared` was dead and could safely be reused as output scratch space without increasing the kernel's 48 KiB shared-memory allocation.
+
+The epilogue became:
+
+```text
+MMA-owned FP32 O registers
+        ↓
+normalize + convert to FP16
+        ↓
+scatter to XOR-swizzled shared memory
+        ↓
+__syncthreads()
+        ↓
+repartition ownership by output row
+        ↓
+32 lanes × half2
+        ↓
+contiguous 128-byte row store
+```
+
+Each lane in the final store phase owned:
+
+```text
+lane 0  → columns 0–1
+lane 1  → columns 2–3
+...
+lane 31 → columns 62–63
+```
+
+so a warp collectively wrote one contiguous 128-byte output row.
+
+The same XOR swizzle used elsewhere in the kernel preserved conflict-free shared-memory access during both the scatter and gather phases.
+
+### Result
+
+```text
+Latency:
+0.0683 ms → 0.0654 ms
+```
+
+approximately a **4% improvement**.
+
+Nsight Compute confirmed the exact intended mechanism:
+
+```text
+Global store bytes/sector:
+16 B → 32 B
+
+Global store sectors:
+65,536 → 32,768
+
+Excessive global sectors:
+32,768 → 0
+```
+
+The optimization added shared loads, shared stores, and synchronization, yet still reduced total kernel time because the resulting global stores were fully coalesced.
+
+This was an important architectural result:
+
+> Tensor Core register ownership and global-memory store ownership do not need to be the same. Shared memory can efficiently transform between the two.
+
+---
+
+# Final Bottleneck Analysis
+
+After the epilogue redesign, the obvious memory-layout problems were effectively exhausted.
+
+Nsight Compute showed that the dominant warp stall was:
+
+```text
+Math Pipe Throttle ≈ 5.46 cycles
+```
+
+while memory-related stalls were much smaller.
+
+Source/SASS correlation was then used to identify the instructions responsible for the throttle.
+
+Approximately **99% of sampled math-pipe-throttle stalls landed on `HMMA.16816.F32` Tensor Core instructions**.
+
+The samples were split approximately:
+
+```text
+QK MMA: ~52%
+PV MMA: ~48%
+```
+
+rather than being concentrated in softmax or scalar FP32 arithmetic.
+
+This established that the mature kernel was primarily constrained by its Tensor Core execution stream rather than by global memory, shared-memory bank conflicts, spilling, or the softmax implementation.
+
+---
+
+# 9C.4 — K/V Software-Pipeline Experiment
+
+The final noncausal optimization experiment attempted to reproduce a more aggressive producer/consumer schedule.
+
+The goal was to overlap:
+
+```text
+V(t) async copy
+with
+QK(t)
+```
+
+and:
+
+```text
+K(t+1) async copy
+with
+softmax(t) + PV(t)
+```
+
+using the existing K and V shared-memory buffers.
+
+No additional shared-memory buffer was introduced.
+
+The conceptual schedule was:
+
+```text
+load K(0)
+
+tile t:
+
+    async V(t)
+        ↓ overlap
+    QK(t)
+
+    async K(t+1)
+        ↓ overlap
+    softmax(t)
+    PV(t)
+
+    continue with K(t+1)
+```
+
+Correct reuse of the shared K buffer required a CTA synchronization point after QK before K(t+1) could begin overwriting K(t).
+
+### Benchmark
+
+The pipelined version regressed:
+
+```text
+baseline:   ~0.0654 ms
+pipelined:  ~0.0684 ms
+```
+
+approximately **4–5% slower**.
+
+A full NCU profile confirmed that this was not simply benchmark noise.
+
+Some parts of the intended mechanism worked:
+
+```text
+Long Scoreboard:
+0.73 → 0.51
+
+Math Pipe Throttle:
+5.46 → 4.96
+```
+
+so the asynchronous copies did successfully hide some memory dependency latency.
+
+However, the required synchronization increased:
+
+```text
+Wait:
+1.19 → 1.46
+
+Barrier:
+0.14 → 0.28
+```
+
+and achieved occupancy fell:
+
+```text
+14.99% → 14.07%
+```
+
+Tensor throughput also declined:
+
+```text
+~13,054 → ~12,669 FP16→FP32 Tensor operations/cycle
+```
+
+while NCU duration increased to approximately:
+
+```text
+106.30 µs
+```
+
+versus roughly:
+
+```text
+103.23 µs
+```
+
+for the non-pipelined shared-epilogue version.
+
+The instruction counts were nearly identical, so the regression was not caused by instruction bloat.
+
+### Conclusion
+
+The software pipeline was rejected.
+
+The experiment demonstrated that additional memory overlap was no longer profitable because the kernel had already become sufficiently Tensor-compute constrained.
+
+The latency hidden by `cp.async` did not compensate for the additional CTA synchronization required to reuse the existing shared-memory buffers safely.
+
+---
+
+# Final Experiment 9 Kernel
+
+The final retained noncausal kernel therefore uses:
+
+```text
+Tile geometry:
+    BlockM = 128
+    BlockN = 128
+    4 warps
+    D = 64
+
+Compute:
+    raw m16n8k16 mma.sync
+    raw ldmatrix operand loading
+    FP16 inputs / FP32 accumulation
+
+Memory:
+    cp.async global → shared staging
+    XOR-swizzled Q/K/V shared layouts
+    48 KiB static shared memory
+
+Softmax:
+    online softmax
+    independent state for both M slices
+    normalized score fragments retained in registers
+
+PV:
+    FP32 score → packed FP16 P conversion
+    direct P×V accumulation into persistent O MMA fragments
+
+Epilogue:
+    reuse dead V shared memory
+    XOR-swizzled output scatter
+    ownership repartition
+    fully coalesced 128-byte row stores
+```
+
+Resource usage remains approximately:
+
+```text
+255 registers/thread
+48 KiB shared memory
+2 CTA/SM theoretical resource limit
+16.67% theoretical occupancy
+```
+
+The final measured target-workload performance was approximately:
+
+```text
+B=1
+H=8
+Nq=Nk=1024
+D=64
+FP16
+noncausal
+
+Custom production kernel:
+~0.0654 ms
+
+PyTorch SDPA:
+~0.081 ms
+```
+
+or roughly **19% lower median latency on this exact specialization and hardware configuration**.
+
+This result should not be generalized to arbitrary attention shapes, head dimensions, causal attention, or other GPUs.
+
+---
+
+# Experiment 9 Takeaways
+
+Experiment 9 changed the optimization strategy from isolated instruction-level improvements to **whole-kernel architecture**.
+
+The major lessons were:
+
+1. **Tile geometry matters more than register count in isolation.**
+   The 128×32 and 128×64 designs used fewer registers but remained slower because they retained repeated softmax and loop overhead.
+
+2. **Large tiles shift the problem toward register lifetime management.**
+   The first full 128×128 implementation reached 255 registers and generated substantial spilling.
+
+3. **Removing spills is not automatically a large performance win.**
+   Direct persistent-O accumulation almost eliminated the original spill pathology but barely changed latency.
+
+4. **Compiler lifetime structure matters.**
+   Reordering softmax normalization, O rescaling, and P conversion improved runtime even though PTXAS still reported a microscopic spill.
+
+5. **Compute ownership and memory ownership should be optimized independently.**
+   MMA accumulator ownership produced inefficient global stores. A shared-memory epilogue transformed the layout and completely eliminated excessive output sectors.
+
+6. **Profiling must determine when to stop.**
+   Once source/SASS analysis showed that nearly all math-pipe throttle originated from HMMA instructions, the remaining limitation was fundamentally Tensor-compute scheduling.
+
+7. **More software pipelining is not automatically better.**
+   The final K/V-overlap experiment reduced scoreboard and math-pipe stalls, but synchronization overhead outweighed the gain and made the kernel slower.
+
+---
+
+# Milestone Conclusion
+
+Experiment 9 completes the performance-optimization phase of the **D64 FP16 noncausal forward specialization**.
+
+The kernel progressed from a `64×32` experimental implementation to a `128×128`, four-warp, production-style architecture using:
+
+```text
+raw Tensor Core MMA
+custom ldmatrix layouts
+cp.async
+swizzled shared memory
+online softmax
+persistent register accumulation
+register-lifetime scheduling
+shared-memory epilogue permutation
+profiler-driven bottleneck attribution
+```
+
+The final rejected software-pipelining experiment provides a natural stopping criterion: further memory overlap no longer improves the kernel because the dominant remaining pressure is the Tensor Core execution stream itself.
+
+The next development milestone is therefore **causal attention**, using tile-level pruning for completely masked KV tiles and fine-grained masking only on the tile intersecting the causal diagonal.
+

@@ -17,8 +17,9 @@ from benchmarks.workloads import (
 DTYPES: dict[str, torch.dtype] = {
     "float32": torch.float32,
     "float16": torch.float16,
-    "bfloat16": torch.bfloat16
+    "bfloat16": torch.bfloat16,
 }
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -29,10 +30,25 @@ def main() -> None:
     parser.add_argument("--key-length", type=int, default=None)
     parser.add_argument("--head-dim", type=int, default=64)
     parser.add_argument("--causal", action="store_true")
-    parser.add_argument("--dtype", type=str, choices=list(DTYPES), default="float32")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        choices=list(DTYPES),
+        default="float32",
+    )
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=25)
+
+    parser.add_argument(
+        "--kernels",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional list of kernel names to benchmark. "
+            "If omitted, all supported kernels are benchmarked."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -67,13 +83,22 @@ def main() -> None:
     results = []
 
     for kernel in KERNELS:
+        if (
+            args.kernels is not None
+            and kernel.name not in args.kernels
+        ):
+            continue
+
         if not kernel.supported(workload):
             print(f"{kernel.name:20s} unsupported")
             continue
 
         result = benchmark_cuda_operation(
             kernel.name,
-            lambda kernel=kernel: kernel.function(inputs, workload),
+            lambda kernel=kernel: kernel.function(
+                inputs,
+                workload,
+            ),
             config,
         )
 
@@ -99,7 +124,11 @@ def main() -> None:
         print()
 
         for result in results:
-            ratio = result.median_ms / baseline.median_ms
+            ratio = (
+                result.median_ms
+                / baseline.median_ms
+            )
+
             print(
                 f"{result.kernel_name:20s} "
                 f"{ratio:8.2f}x SDPA latency"

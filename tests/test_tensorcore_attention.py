@@ -298,19 +298,21 @@ def test_tensorcore_attention_bc32_raw_pv_matches_sdpa(
         )
 
 
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     ("batch", "heads", "sequence_length"),
     [
         (1, 2, 128),
         (1, 4, 256),
         (1, 8, 512),
-        (1, 8, 1024)
+        (1, 8, 1024),
     ],
 )
 def test_tensorcore_attention_production_128x128_matches_sdpa(
     batch: int,
     heads: int,
     sequence_length: int,
+    causal: bool,
 ) -> None:
     torch.manual_seed(0)
 
@@ -339,15 +341,13 @@ def test_tensorcore_attention_production_128x128_matches_sdpa(
         dtype=torch.float16,
     ).contiguous()
 
-    expected = (
-        torch.nn.functional
-        .scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            dropout_p=0.0,
-            is_causal=False,
-        )
+    expected = F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=causal,
     )
 
     actual = (
@@ -356,6 +356,7 @@ def test_tensorcore_attention_production_128x128_matches_sdpa(
             query,
             key,
             value,
+            causal,
         )
     )
 
