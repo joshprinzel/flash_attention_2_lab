@@ -60,6 +60,12 @@ torch::Tensor tensorcore_attention_forward_bc32_raw_qk_raw_pv(
     torch::Tensor value
 );
 
+torch::Tensor tensorcore_attention_forward_production_128x64(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
     module.def(
         "copy_cuda",
@@ -124,5 +130,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module){
         "tensorcore_attention_forward_bc32_raw_qk_raw_pv",
         &tensorcore_attention_forward_bc32_raw_qk_raw_pv,
         "Fused FP16 Tensor Core attention with raw MMA QK"
+    );
+
+    module.def(
+        "tensorcore_attention_forward_production_128x64",
+        &tensorcore_attention_forward_production_128x64,
+        "Production kernel"
     );
 }

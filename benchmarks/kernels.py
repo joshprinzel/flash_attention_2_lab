@@ -109,6 +109,18 @@ def tensorcore_attention_bc32_raw_qk_raw_pv(
         )
     )
 
+def tensorcore_attention_production_128x64(
+    inputs: AttentionInputs,
+    workload: AttentionWorkload,
+) -> Tensor:
+    return (
+        flash_attention_cuda
+        .tensorcore_attention_forward_production_128x64(
+            inputs.query,
+            inputs.key,
+            inputs.value,
+        )
+    )
 def pytorch_sdpa(
     inputs: AttentionInputs,
     workload: AttentionWorkload,
@@ -206,6 +218,17 @@ KERNELS = [
     KernelSpec(
         name="tensorcore_bc32_raw_qk_raw_pv",
         function=tensorcore_attention_bc32_raw_qk_raw_pv,
+        supported=lambda workload: (
+            workload.dtype == torch.float16
+            and workload.query_length == workload.key_length
+            and workload.head_dimension == 64
+            and workload.query_length % 32 == 0
+            and not workload.causal
+        ),
+    ),
+    KernelSpec(
+        name="tensorcore_production_128x64",
+        function=tensorcore_attention_production_128x64,
         supported=lambda workload: (
             workload.dtype == torch.float16
             and workload.query_length == workload.key_length

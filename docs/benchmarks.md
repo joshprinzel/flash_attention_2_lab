@@ -1740,3 +1740,793 @@ This indicates that the kernel has shifted away from being dominated by avoidabl
 Further pipeline complexity is unlikely to provide high ROI because the additional K stage already makes shared memory the occupancy limiter.
 
 The next optimization phase therefore shifts from changing the instruction path to **retuning resource usage and execution geometry so the existing fast path remains better fed**.
+
+
+# Experiment 8 — Resource, Geometry, and Shared-Memory Layout Retuning
+
+## Objective
+
+Experiment 7 established the main fast-path architecture:
+
+* raw `mma.sync` QK and PV
+* register-resident online softmax
+* direct register P → PV handoff
+* padded Q/K/V shared-memory layouts for conflict-free `ldmatrix`
+* `half2` output stores
+* `cp.async` K/V staging
+* K double buffering
+* V/K software pipelining
+
+By the end of Experiment 7, the kernel had removed most obvious shared-memory materialization and synchronization overhead. Experiment 8 therefore shifted focus from instruction selection toward **resource utilization, CTA geometry, and shared-memory transaction efficiency**.
+
+The starting checkpoint was the final Experiment 7D.3 kernel:
+
+```text
+Workload:
+B=1, H=8, D=64, FP16, noncausal
+Bc=32
+4 warps / CTA
+64 query rows / CTA
+128 threads / CTA
+
+N=512:   ~0.0268 ms
+N=1024:  ~0.0781 ms
+```
+
+Resource/profile state:
+
+```text
+Registers/thread:             72
+Static shared memory:         23,552 B
+Spills:                       0
+
+Theoretical occupancy:        33.3%
+Achieved occupancy:           ~25.9%
+Shared-memory block limit:    4 CTAs/SM
+Register block limit:         7 CTAs/SM
+
+Warp cycles / issued inst:    9.80
+Math-pipe throttle:           3.16 cycles
+Short scoreboard:             1.31
+MIO throttle:                 0.15
+
+Global excessive sectors:     557,056
+Shared excessive wavefronts:  425,984
+```
+
+The major open question was:
+
+> With the major algorithmic and instruction-level inefficiencies removed, can launch geometry, resource usage, or shared-memory layout expose additional useful work to the scheduler?
+
+---
+
+# 8A — Re-unroll the `cp.async` staging loop
+
+## Hypothesis
+
+The rolled `cp.async` staging helper had previously reduced register usage from 99 to 72 registers/thread.
+
+After later optimizations, there appeared to be unused register headroom because shared memory—not registers—limited CTA residency.
+
+The hypothesis was therefore that fully unrolling the staging loop might recover instruction-level parallelism without materially reducing occupancy.
+
+## Change
+
+Changed:
+
+```cpp
+#pragma unroll 1
+```
+
+back to full unrolling in the asynchronous staging helper.
+
+## Result
+
+```text
+                 Rolled baseline    Fully unrolled
+
+N=512              ~0.0268 ms         0.0316 ms
+N=1024             ~0.0781 ms         0.0792 ms
+```
+
+N=512 regressed by roughly 18%.
+
+## Conclusion
+
+**Rejected.**
+
+The assumption that unused register capacity implied profitable unrolling was incorrect.
+
+Register count alone was not the relevant variable. Unrolling changed instruction scheduling, live ranges, and control structure enough to reduce performance despite theoretically available register capacity.
+
+The rolled staging loop remained the preferred implementation.
+
+---
+
+# 8B — 8 warps per CTA
+
+## Hypothesis
+
+Nsight showed relatively few eligible warps per scheduler. Increasing the number of warps per block might increase available independent work and improve latency hiding.
+
+The fast-path launch geometry was therefore parameterized independently of the legacy kernels.
+
+The experiment changed:
+
+```text
+4 warps / CTA
+64 query rows / CTA
+```
+
+to:
+
+```text
+8 warps / CTA
+128 query rows / CTA
+```
+
+while preserving 16 query rows per warp.
+
+## Result
+
+```text
+                 4 warps baseline    8 warps
+
+N=512              ~0.0268 ms        0.0313 ms
+N=1024             ~0.0781 ms        0.0789 ms
+```
+
+At N=512, the grid fell to only 32 CTAs—fewer CTAs than the GPU's 36 SMs.
+
+## Conclusion
+
+**Rejected.**
+
+Increasing warps per CTA reduced grid-level parallelism too aggressively.
+
+The experiment demonstrated that additional intra-CTA warps are not equivalent to more useful scheduler parallelism when the total number of CTAs collapses.
+
+---
+
+# 8C — 2 warps per CTA
+
+## Hypothesis
+
+The inverse experiment tested whether smaller CTAs could expose more grid-level parallelism.
+
+Changing from four to two warps doubled the number of CTAs:
+
+```text
+N=1024:
+4 warps → 128 CTAs
+2 warps → 256 CTAs
+```
+
+## Result
+
+```text
+N=1024:
+
+4 warps:  ~0.0781 ms
+2 warps:   0.1006 ms
+```
+
+Approximately a 29% regression.
+
+## Cause
+
+The total number of query-processing warps remained similar, but each smaller CTA independently staged its own K/V tiles.
+
+This duplicated:
+
+* K/V global traffic
+* `cp.async` work
+* shared-memory staging
+* CTA synchronization
+* block-level bookkeeping
+
+The extra CTAs therefore increased overhead rather than increasing useful work.
+
+## Conclusion
+
+**Rejected.**
+
+For the existing 64×32 architecture, four warps per CTA represented the best balance between:
+
+* K/V reuse
+* CTA count
+* grid-level parallelism
+* synchronization overhead
+
+Experiment 8B/8C therefore closed the coarse CTA-geometry search.
+
+---
+
+# 8D — Investigating `cp.async` transaction fragmentation
+
+After the geometry experiments failed, the memory profile revealed a much more concrete anomaly.
+
+The baseline kernel executed:
+
+```text
+LDGSTS / cp.async warp instructions: 65,536
+```
+
+Each warp-level `cp.async` moves:
+
+```text
+32 lanes × 16 B = 512 B
+```
+
+which ideally requires:
+
+```text
+512 B / 32 B = 16 global sectors
+```
+
+Therefore ideal global traffic was:
+
+```text
+65,536 × 16 = 1,048,576 sectors
+```
+
+Actual traffic was:
+
+```text
+1,572,864 sectors
+```
+
+giving:
+
+```text
+524,288 excessive cp.async sectors
+```
+
+This accounted for approximately 94% of the kernel's total 557,056 excessive global sectors.
+
+The shared-memory side showed the same phenomenon:
+
+```text
+Actual LDGSTS shared wavefronts:  688,128
+Ideal:                            262,144
+
+Excess:                           425,984
+```
+
+This excess exactly matched the kernel-wide shared-memory excessive-wavefront count.
+
+Critically:
+
+```text
+LDGSTS bank conflicts = 0
+```
+
+The problem was therefore **transaction fragmentation**, not shared-memory bank conflicts.
+
+---
+
+# Why the padded layout caused the problem
+
+Experiment 7A.6 had changed Q/K/V shared-memory strides from:
+
+```text
+64 half = 128 B
+```
+
+to:
+
+```text
+72 half = 144 B
+```
+
+This successfully eliminated severe `ldmatrix` bank conflicts.
+
+However, it also caused each row to advance by 144 B rather than 128 B.
+
+The row starting addresses therefore drifted across 128-byte transaction boundaries:
+
+```text
+row 0: +0 B
+row 1: +144 B
+row 2: +288 B
+...
+```
+
+The padded layout was excellent for `ldmatrix`, but poor for dense 16-byte asynchronous stores.
+
+The next objective became:
+
+> Preserve conflict-free `ldmatrix` access while restoring dense, transaction-friendly 128-byte rows.
+
+---
+
+# 8D.1 — Compact XOR-swizzled V layout
+
+V was chosen first because:
+
+* it is single-buffered
+* it is consumed by the raw PV path
+* its access pattern is simpler than K's QK transpose path
+
+The new V layout used:
+
+```text
+64 half / row
+128 B / row
+8 chunks / row
+8 half / chunk
+16 B / chunk
+```
+
+For logical chunk `c` in row `r`:
+
+```cpp
+physical_chunk = c ^ (r & 7);
+```
+
+The global tensor remained ordinary row-major.
+
+Only the shared-memory destination was permuted.
+
+Because XOR is self-inverse, the consumer could recover the location using the same mapping.
+
+---
+
+## Memory result
+
+The V-only swizzle produced exactly the expected reduction:
+
+```text
+                              7D.3         V swizzle
+
+LDGSTS instructions           65,536         65,536
+
+LDGSTS global sectors      1,572,864      1,310,720
+change                                     -262,144
+
+LDGSTS shared wavefronts     688,128        475,136
+change                                     -212,992
+
+Global excessive sectors     557,056        294,912
+Shared excessive waves       425,984        212,992
+```
+
+V represented essentially one-half of the K/V staging traffic, and the experiment removed essentially one-half of both forms of transaction fragmentation.
+
+This strongly validated the shared-memory-layout hypothesis.
+
+---
+
+## Initial implementation cost
+
+The first implementation produced:
+
+```text
+Registers/thread: 72 → 102
+```
+
+and scheduler behavior deteriorated:
+
+```text
+Warp cycles / issued inst:  9.80 → 10.73
+Math-pipe throttle:         3.16 → 4.42
+MIO throttle:               0.15 → 0.32
+```
+
+Despite the large memory improvement, wall-clock performance remained approximately neutral at N=1024 and regressed at N=512.
+
+This was an important result:
+
+> Fixing the memory transaction problem was not sufficient if the address-generation implementation introduced excessive register and arithmetic pressure.
+
+---
+
+# 8D.2 — Simplified swizzle address generation
+
+The producer and consumer address calculations were rewritten to expose the underlying power-of-two structure directly.
+
+For the producer:
+
+```cpp
+local_row       = copy >> 3;
+logical_chunk   = copy & 7;
+physical_chunk  = logical_chunk ^ (local_row & 7);
+
+shared_offset =
+    (local_row << 6)
+    + (physical_chunk << 3);
+```
+
+The V consumer was similarly simplified.
+
+The shared-memory layout itself did not change.
+
+---
+
+## Result
+
+Register usage dropped dramatically:
+
+```text
+V swizzle v1:   102 registers/thread
+V swizzle v2:    83 registers/thread
+```
+
+Static shared memory remained:
+
+```text
+23,040 B
+```
+
+with zero spills.
+
+Performance:
+
+```text
+N=512:   0.0324 ms
+N=1024:  0.0777 ms
+```
+
+The N=1024 result returned to approximately the pre-swizzle performance region while retaining the memory-transaction improvement.
+
+The profile showed scheduler behavior almost fully restored:
+
+```text
+                              7D.3       V-swizzle v2
+
+Warp cycles/issued inst       9.80           9.83
+Math-pipe throttle            3.16           3.26
+MIO throttle                  0.15           0.18
+
+Global excessive             557,056        294,912
+Shared excessive             425,984        212,992
+```
+
+The simplified implementation therefore separated the two effects:
+
+1. the swizzled memory layout was beneficial;
+2. the original address-generation implementation was unnecessarily expensive.
+
+---
+
+# 8D.3 — Compact XOR-swizzled K + V
+
+With the V result validated, the same physical layout was extended to K.
+
+The fast-path K shared-memory stride became:
+
+```text
+72 → 64 half
+```
+
+for both K buffers.
+
+K remained double buffered.
+
+The pipeline itself was unchanged.
+
+The raw-QK consumer translated logical K coordinates into the compact swizzled layout before issuing:
+
+```text
+ldmatrix.sync.aligned.m8n8.x2.shared.b16
+```
+
+---
+
+## Shared-memory footprint
+
+Compacting K saved:
+
+```text
+2 buffers
+× 32 rows
+× 8 half padding
+× 2 bytes
+= 1,024 B
+```
+
+Combined K+V compaction reduced the fast kernel from approximately:
+
+```text
+23,552 B → 22,016 B static shared memory
+```
+
+Register usage became:
+
+```text
+96 registers/thread
+```
+
+with zero spills.
+
+Shared memory still limited residency to four CTAs/SM; registers permitted five.
+
+Therefore the increased register count did not reduce theoretical occupancy.
+
+---
+
+# Final memory result
+
+The K+V swizzle completely eliminated the `cp.async` transaction inefficiency.
+
+```text
+                              7D.3         V-only        K+V
+
+LDGSTS instructions           65,536        65,536       65,536
+
+LDGSTS global sectors      1,572,864     1,310,720    1,048,576
+
+LDGSTS shared wavefronts     688,128       475,136      262,144
+
+Global excessive             557,056       294,912       32,768
+
+Shared excessive             425,984       212,992            0
+```
+
+The final `cp.async` values are exactly the theoretical ideal:
+
+```text
+65,536 × 16 global sectors
+= 1,048,576
+
+65,536 × 4 shared wavefronts
+= 262,144
+```
+
+Nsight also reports:
+
+```text
+Shared actual wavefronts = Shared ideal wavefronts
+Shared excessive = 0
+
+Global excessive sectors = 32,768
+```
+
+The remaining global-sector excess comes from the already-known output-store layout rather than asynchronous K/V staging.
+
+---
+
+# Scheduler result
+
+Interestingly, fully swizzling K did not significantly damage scheduler behavior.
+
+Compared with V-only:
+
+```text
+                              V-only         K+V
+
+Registers                       83             96
+Instructions executed        7.380 M        7.350 M
+
+Warp cycles/issued inst        9.83           9.53
+Math-pipe throttle             3.26           3.12
+Wait                           2.05           1.97
+Barrier                        0.94           0.72
+MIO throttle                   0.18           0.14
+
+Short scoreboard               1.22           1.39
+```
+
+The scheduler actually improved on most measured stall categories.
+
+The remaining major symptom was unchanged:
+
+```text
+~0.43 eligible warps / scheduler
+~68% cycles with no eligible warp
+```
+
+The kernel therefore remained latency/scheduling constrained rather than bandwidth constrained.
+
+---
+
+# End-to-end performance
+
+The K+V-swizzled version measured approximately:
+
+```text
+N=512:   0.0262 ms
+N=1024:  0.0805 ms
+```
+
+This was slightly better than prior checkpoints at N=512, but somewhat slower than the best ~0.077–0.078 ms N=1024 results.
+
+Nsight duration changed only modestly:
+
+```text
+V-only:  ~112.6 us
+K+V:     ~113.4 us
+```
+
+The important conclusion is therefore not that K/V swizzling produced a large latency win.
+
+It demonstrated something more useful:
+
+> Once `cp.async` transaction fragmentation was completely removed, kernel latency barely changed.
+
+That establishes that memory-transaction inefficiency is no longer the dominant limitation.
+
+---
+
+# Experiment 8 conclusions
+
+Experiment 8 ruled out several plausible optimization directions.
+
+## Rejected
+
+```text
+Fully unrolling cp.async staging
+→ scheduler/live-range regression
+
+8 warps / CTA
+→ insufficient grid parallelism
+
+2 warps / CTA
+→ duplicated K/V staging and CTA overhead
+```
+
+## Validated
+
+```text
+4 warps / CTA
+→ best geometry for the existing 64×32 architecture
+
+Compact XOR-swizzled K/V shared memory
+→ transaction-efficient cp.async
+→ conflict-compatible ldmatrix access
+```
+
+The most important quantitative result was:
+
+```text
+Original global excessive sectors:    557,056
+Final global excessive sectors:        32,768
+
+Original shared excessive waves:      425,984
+Final shared excessive waves:               0
+```
+
+Thus essentially all K/V staging fragmentation was eliminated.
+
+---
+
+# Final Experiment 8 architecture
+
+```text
+FP16 D=64 noncausal fast path
+
+CTA:
+    4 warps
+    128 threads
+    64 query rows
+    32 key/value rows per iteration
+
+Q:
+    padded 72-half shared layout
+
+K:
+    double-buffered
+    compact 64-half rows
+    XOR-swizzled 16-byte chunks
+
+V:
+    compact 64-half rows
+    XOR-swizzled 16-byte chunks
+
+QK:
+    raw mma.sync
+    ldmatrix
+    FP32 register accumulators
+
+Softmax:
+    online
+    register resident
+
+P:
+    direct register → MMA operand conversion
+
+PV:
+    raw mma.sync
+
+Output:
+    half2 stores
+
+K/V movement:
+    cp.async
+    software pipelined
+    ideal global transaction count
+    ideal shared wavefront count
+```
+
+---
+
+# Why Experiment 8 ends here
+
+A possible follow-up was to continue reducing swizzle address-generation register pressure—for example by hoisting lane-invariant address components.
+
+That may still recover a small number of registers.
+
+However, Experiment 8 has already answered the larger architectural question.
+
+The current kernel is no longer meaningfully limited by:
+
+```text
+cp.async transaction fragmentation
+ldmatrix bank conflicts
+global-memory bandwidth
+shared-memory bandwidth
+register-induced occupancy loss
+coarse CTA geometry
+```
+
+The remaining profile is dominated by:
+
+```text
+low eligible-warp count
+dependency chains
+math-pipeline pressure
+scalar softmax/bookkeeping work
+limited useful work per CTA relative to production kernels
+```
+
+Further polishing of the existing 64×32 architecture is therefore expected to produce diminishing returns.
+
+---
+
+# Transition to Experiment 9
+
+Experiment 9 changes the optimization target from:
+
+> Make the existing 64×32 kernel execute more efficiently.
+
+to:
+
+> Increase the amount of useful Tensor Core work performed per CTA.
+
+The current architecture processes:
+
+```text
+BlockM = 64
+BlockN = 32
+warps  = 4
+```
+
+A production-style FlashAttention architecture for this workload instead motivates something closer to:
+
+```text
+BlockM = 128
+BlockN = 128
+warps  = 4
+```
+
+The key difference is not more warps.
+
+It is **more MMA work per warp and per CTA**, with carefully controlled register lifetimes.
+
+Experiment 9 will therefore redesign:
+
+```text
+warp-level M ownership
+score-fragment ownership
+softmax row ownership
+P → PV fragment mapping
+larger K/V tiles
+register lifetime scheduling
+output epilogue layout
+```
+
+while preserving the lessons already validated in Experiments 1–8:
+
+```text
+raw MMA
+register softmax
+register P handoff
+cp.async
+software pipelining
+swizzled shared-memory layouts
+profiling-driven resource decisions
+```
+
+Experiment 8 therefore marks the end of optimizing the original tiled architecture.
+
+**Experiment 9 begins the production-style kernel redesign.**

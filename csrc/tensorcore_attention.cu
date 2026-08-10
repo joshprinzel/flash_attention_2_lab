@@ -34,6 +34,22 @@ constexpr int kQueryRowsPerWarp = 16;
 constexpr int kQueryTileSize =
     kWarpsPerBlock * kQueryRowsPerWarp;
 
+/*
+Experiment 9: Production-style CTA geometry.
+
+9A keeps BlockN=32 while introducing
+BlockM=128 with four warps
+*/
+
+constexpr int kProductionBlockM = 128;
+constexpr int kProductionBlockN = 64;
+
+constexpr int kProductionWarpsPerBlock = 4;
+constexpr int kProductionThreadsPerBlock = kProductionWarpsPerBlock * kWarpSize;
+constexpr int kProductionMmaRowsPerWarp = kProductionBlockM / (kProductionWarpsPerBlock * kMmaM);
+
+static_assert(kProductionMmaRowsPerWarp == 2);
+
 constexpr unsigned int kFullWarpMask = 0xffffffffu;
 
 struct MmaOperandA {
@@ -211,6 +227,99 @@ __device__ __forceinline__ MmaOperandB load_mma_b_k_transpose_from_row_major(
 }
 
 __device__ __forceinline__
+int swizzled_value_chunk(
+    int row,
+    int logical_chunk
+){
+    return logical_chunk ^ (row & 7);
+}
+
+__device__ __forceinline__
+MmaOperandB load_mma_b_col_major_from_swizzled_value(
+    const half* matrix,
+    int reduction_offset,
+    int logical_column_offset
+){
+    const int lane_id = static_cast<int>(threadIdx.x) & 31;
+    const int address_lane = lane_id & 15;
+
+    const int logical_row =
+        reduction_offset + address_lane;
+
+    const int logical_chunk =
+        logical_column_offset >> 3;
+
+    const int physical_chunk =
+        logical_chunk ^ (address_lane & 7);
+
+    const int half_offset =
+        (logical_row << 6) +
+        (physical_chunk << 3);
+
+    const uint32_t address =
+        shared_address(matrix + half_offset);
+
+    MmaOperandB fragment;
+
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+        "{%0, %1}, [%2];\n"
+        : "=r"(fragment.registers[0]),
+          "=r"(fragment.registers[1])
+        : "r"(address)
+    );
+    return fragment;
+
+}
+
+__device__ __forceinline__
+MmaOperandB load_mma_b_k_transpose_from_swizzled_row_major(
+    const half* matrix,
+    int key_row_offset,
+    int dimension_offset
+) {
+    const int lane_id =
+        static_cast<int>(threadIdx.x) & 31;
+
+    const int address_lane =
+        lane_id & 15;
+
+    const int row_within_tile =
+        address_lane & 7;
+
+    const int matrix_index =
+        address_lane >> 3;
+
+    const int logical_row =
+        key_row_offset + row_within_tile;
+
+    const int logical_chunk =
+        (dimension_offset >> 3) + matrix_index;
+
+    const int physical_chunk =
+        logical_chunk ^ row_within_tile;
+
+    const int half_offset =
+        (logical_row << 6) +
+        (physical_chunk << 3);
+
+    const uint32_t address =
+        shared_address(matrix + half_offset);
+
+    MmaOperandB fragment;
+
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+        "{%0, %1}, [%2];\n"
+        : "=r"(fragment.registers[0]),
+          "=r"(fragment.registers[1])
+        : "r"(address)
+    );
+
+    return fragment;
+}
+
+__device__ __forceinline__
 void mma_m16n8k16_f16_f32(
     MmaAccumulator& accumulator,
     const MmaOperandA& matrix_a,
@@ -280,7 +389,248 @@ __device__ __forceinline__ MmaOperandA make_probability_mma_a(
 
     return fragment;
 }
+template<int kScoreSubtiles>
+__device__ __forceinline__
+void normalize_score_tile_and_make_probability(
+    MmaAccumulator (&score_accumulators)[kScoreSubtiles],
+    float scale,
+    int lane_id,
+    float& running_row_max,
+    float& running_row_sum,
+    MmaOperandA (&probability_fragments)[kScoreSubtiles / 2],
+    float& previous_scale_for_lane
+) {
+    static_assert(kScoreSubtiles % 2 == 0);
 
+    float upper_max = -CUDART_INF_F;
+    float lower_max = -CUDART_INF_F;
+
+#pragma unroll
+    for (
+        int score_subtile = 0;
+        score_subtile < kScoreSubtiles;
+        ++score_subtile
+    ) {
+        upper_max = fmaxf(
+            upper_max,
+            fmaxf(
+                score_accumulators[score_subtile].registers[0] * scale,
+                score_accumulators[score_subtile].registers[1] * scale
+            )
+        );
+
+        lower_max = fmaxf(
+            lower_max,
+            fmaxf(
+                score_accumulators[score_subtile].registers[2] * scale,
+                score_accumulators[score_subtile].registers[3] * scale
+            )
+        );
+    }
+
+    upper_max = fmaxf(
+        upper_max,
+        __shfl_xor_sync(kFullWarpMask, upper_max, 1, 4)
+    );
+    upper_max = fmaxf(
+        upper_max,
+        __shfl_xor_sync(kFullWarpMask, upper_max, 2, 4)
+    );
+
+    lower_max = fmaxf(
+        lower_max,
+        __shfl_xor_sync(kFullWarpMask, lower_max, 1, 4)
+    );
+    lower_max = fmaxf(
+        lower_max,
+        __shfl_xor_sync(kFullWarpMask, lower_max, 2, 4)
+    );
+
+    const int canonical_source_lane =
+        (lane_id & 7) * 4;
+
+    const float canonical_upper_max =
+        __shfl_sync(
+            kFullWarpMask,
+            upper_max,
+            canonical_source_lane
+        );
+
+    const float canonical_lower_max =
+        __shfl_sync(
+            kFullWarpMask,
+            lower_max,
+            canonical_source_lane
+        );
+
+    float tile_row_max = -CUDART_INF_F;
+
+    if (lane_id < 8) {
+        tile_row_max = canonical_upper_max;
+    } else if (lane_id < 16) {
+        tile_row_max = canonical_lower_max;
+    }
+
+    float new_row_max_for_lane = -CUDART_INF_F;
+    previous_scale_for_lane = 0.0f;
+
+    if (lane_id < kQueryRowsPerWarp) {
+        new_row_max_for_lane =
+            fmaxf(
+                running_row_max,
+                tile_row_max
+            );
+
+        previous_scale_for_lane =
+            running_row_sum == 0.0f
+                ? 0.0f
+                : __expf(
+                    running_row_max -
+                    new_row_max_for_lane
+                );
+
+        running_row_max =
+            new_row_max_for_lane;
+    }
+
+    const int group_id =
+        lane_id >> 2;
+
+    const float upper_new_row_max =
+        __shfl_sync(
+            kFullWarpMask,
+            new_row_max_for_lane,
+            group_id
+        );
+
+    const float lower_new_row_max =
+        __shfl_sync(
+            kFullWarpMask,
+            new_row_max_for_lane,
+            group_id + 8
+        );
+
+    float upper_probability_sum = 0.0f;
+    float lower_probability_sum = 0.0f;
+
+#pragma unroll
+    for (
+        int score_subtile = 0;
+        score_subtile < kScoreSubtiles;
+        ++score_subtile
+    ) {
+        MmaAccumulator& score_accumulator =
+            score_accumulators[score_subtile];
+
+        score_accumulator.registers[0] =
+            __expf(
+                score_accumulator.registers[0] * scale -
+                upper_new_row_max
+            );
+
+        score_accumulator.registers[1] =
+            __expf(
+                score_accumulator.registers[1] * scale -
+                upper_new_row_max
+            );
+
+        score_accumulator.registers[2] =
+            __expf(
+                score_accumulator.registers[2] * scale -
+                lower_new_row_max
+            );
+
+        score_accumulator.registers[3] =
+            __expf(
+                score_accumulator.registers[3] * scale -
+                lower_new_row_max
+            );
+
+        upper_probability_sum +=
+            score_accumulator.registers[0] +
+            score_accumulator.registers[1];
+
+        lower_probability_sum +=
+            score_accumulator.registers[2] +
+            score_accumulator.registers[3];
+    }
+
+    upper_probability_sum +=
+        __shfl_xor_sync(
+            kFullWarpMask,
+            upper_probability_sum,
+            1,
+            4
+        );
+    upper_probability_sum +=
+        __shfl_xor_sync(
+            kFullWarpMask,
+            upper_probability_sum,
+            2,
+            4
+        );
+
+    lower_probability_sum +=
+        __shfl_xor_sync(
+            kFullWarpMask,
+            lower_probability_sum,
+            1,
+            4
+        );
+    lower_probability_sum +=
+        __shfl_xor_sync(
+            kFullWarpMask,
+            lower_probability_sum,
+            2,
+            4
+        );
+
+    const float canonical_upper_sum =
+        __shfl_sync(
+            kFullWarpMask,
+            upper_probability_sum,
+            canonical_source_lane
+        );
+
+    const float canonical_lower_sum =
+        __shfl_sync(
+            kFullWarpMask,
+            lower_probability_sum,
+            canonical_source_lane
+        );
+
+    float tile_row_sum = 0.0f;
+
+    if (lane_id < 8) {
+        tile_row_sum = canonical_upper_sum;
+    } else if (lane_id < 16) {
+        tile_row_sum = canonical_lower_sum;
+    }
+
+    if (lane_id < kQueryRowsPerWarp) {
+        running_row_sum =
+            previous_scale_for_lane *
+                running_row_sum +
+            tile_row_sum;
+    }
+
+#pragma unroll
+    for (
+        int probability_fragment = 0;
+        probability_fragment < kScoreSubtiles / 2;
+        ++probability_fragment
+    ) {
+        probability_fragments[probability_fragment] =
+            make_probability_mma_a(
+                score_accumulators[
+                    probability_fragment * 2
+                ],
+                score_accumulators[
+                    probability_fragment * 2 + 1
+                ]
+            );
+    }
+}
 template<int kKeyTileSize>
 __device__ __forceinline__
 void stage_tile_async_16(
@@ -308,6 +658,61 @@ void stage_tile_async_16(
         copy_global_to_shared_async_16(&shared_tile[local_row * shared_stride + dimension], &global_tensor[global_index]);
     }
 
+}
+
+
+
+template<int kKeyTileSize>
+__device__ __forceinline__
+void stage_tile_async_16_swizzled_64(
+    half* shared_tile,
+    const half* global_value,
+    int64_t tile_start,
+    int64_t tensor_base,
+    int thread_id,
+    int thread_count
+) {
+    constexpr int kHalfElementsPerAsyncCopy = 8;
+    constexpr int kCopiesPerRow =
+        kHeadDimension / kHalfElementsPerAsyncCopy;
+    constexpr int kTileCopies =
+        kKeyTileSize * kCopiesPerRow;
+
+#pragma unroll 1
+    for (
+        int copy = thread_id;
+        copy < kTileCopies;
+        copy += thread_count
+    ) {
+        const int local_row =
+            copy >> 3;
+
+        const int logical_chunk =
+            copy & 7;
+
+        const int logical_dimension =
+            logical_chunk << 3;
+
+        const int physical_chunk =
+            logical_chunk ^ (local_row & 7);
+
+        const int physical_dimension =
+            physical_chunk << 3;
+
+        const int64_t global_index =
+            tensor_base +
+            ((tile_start + local_row) << 6) +
+            logical_dimension;
+
+        const int shared_offset =
+            (local_row << 6) +
+            physical_dimension;
+
+        copy_global_to_shared_async_16(
+            &shared_tile[shared_offset],
+            &global_value[global_index]
+        );
+    }
 }
 
 
@@ -379,6 +784,8 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         kHeadDimension;
 
     constexpr int kSharedHeadStride = kHeadDimension + 8; // 72 
+    constexpr int kValueSharedStride = (kUseRawQk && kUseRawPv) ? kHeadDimension : kSharedHeadStride;
+    constexpr int kKeySharedStride = (kUseRawQk && kUseRawPv) ? kHeadDimension : kSharedHeadStride;
     /*
      * Shared-memory layout
      *
@@ -398,19 +805,19 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
     constexpr int kKeySharedStages = (kUseRawQk && kUseRawPv) ? 2 : 1;
 
-    __shared__ __align__(32)
+    __shared__ __align__(128)
     half key_shared[kKeySharedStages]
     [
         kKeyTileSize
     ][
-        kSharedHeadStride
+        kKeySharedStride
     ];
 
-    __shared__ __align__(32)
+    __shared__ __align__(128)
     half value_shared[
         kKeyTileSize
     ][
-        kSharedHeadStride
+        kValueSharedStride
     ];
 
     constexpr int kScoreSharedWarps = kUseRawQk ? 1 : kKernelWarpsPerBlock;
@@ -544,21 +951,19 @@ __global__ void tensorcore_attention_forward_kernel_d64(
         Prime pipeline with K0 and V0.
         */
 
-        stage_tile_async_16<kKeyTileSize>(
+        stage_tile_async_16_swizzled_64<kKeyTileSize>(
             &key_shared[0][0][0],
             key,
             0,
             tensor_base,
-            kSharedHeadStride,
             thread_id,
             kKernelThreadsPerBlock
         );
-        stage_tile_async_16<kKeyTileSize>(
+        stage_tile_async_16_swizzled_64<kKeyTileSize>(
             &value_shared[0][0],
             value,
             0,
             tensor_base,
-            kSharedHeadStride,
             thread_id,
             kKernelThreadsPerBlock
         );
@@ -601,12 +1006,11 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
             if(has_next_tile){
                 const int next_key_stage = key_stage ^ 1;
-                stage_tile_async_16<kKeyTileSize>(
+                stage_tile_async_16_swizzled_64<kKeyTileSize>(
                     &key_shared[next_key_stage][0][0],
                     key,
                     next_key_tile_start,
                     tensor_base,
-                    kSharedHeadStride,
                     thread_id,
                     kKernelThreadsPerBlock
                 );
@@ -678,9 +1082,8 @@ __global__ void tensorcore_attention_forward_kernel_d64(
                 #pragma unroll
                 for(int score_subtile = 0; score_subtile < kRawScoresSubtiles; ++score_subtile){
                     const int key_offset = score_subtile * kRawMmaOutputColumns;
-                    const half* key_tile = &key_shared[key_stage][key_offset][dimension_offset];
 
-                    const MmaOperandB key_fragment = load_mma_b_k_transpose_from_row_major(key_tile, kSharedHeadStride);
+                    const MmaOperandB key_fragment = load_mma_b_k_transpose_from_swizzled_row_major(&key_shared[key_stage][0][0], key_offset, dimension_offset);
                     mma_m16n8k16_f16_f32(score_accumulators[score_subtile], query_fragment, key_fragment);
                 }
             }
@@ -1169,17 +1572,31 @@ __global__ void tensorcore_attention_forward_kernel_d64(
             ) {
                 const int reduction_offset = reduction_subtile * kMmaK;
 
-                const half* value_tile = &value_shared[reduction_offset][output_dimension_offset];
-                
-
                 const MmaOperandA& probability_fragment = probability_fragments[reduction_subtile];
 
+                MmaOperandB value_fragment;
 
-                const MmaOperandB value_fragment =
-                    load_mma_b_col_major_from_row_major(
-                        value_tile,
-                        kSharedHeadStride
-                    );
+                if constexpr (kUseRawQk && kUseRawPv) {
+                    value_fragment =
+                        load_mma_b_col_major_from_swizzled_value(
+                            &value_shared[0][0],
+                            reduction_offset,
+                            output_dimension_offset
+                        );
+                } else {
+                    const half* value_tile =
+                        &value_shared[
+                            reduction_offset
+                        ][
+                            output_dimension_offset
+                        ];
+
+                    value_fragment =
+                        load_mma_b_col_major_from_row_major(
+                            value_tile,
+                            kValueSharedStride
+                        );
+                }
 
                 mma_m16n8k16_f16_f32(
                     pv_accumulator,
@@ -1406,12 +1823,11 @@ __global__ void tensorcore_attention_forward_kernel_d64(
             * It will remain in flight as the next
             * iteration starts QK + softmax.
             */
-            stage_tile_async_16<kKeyTileSize>(
+            stage_tile_async_16_swizzled_64<kKeyTileSize>(
                 &value_shared[0][0],
                 value,
                 next_key_tile_start,
                 tensor_base,
-                kSharedHeadStride,
                 thread_id,
                 kKernelThreadsPerBlock
             );
@@ -1532,6 +1948,764 @@ __global__ void tensorcore_attention_forward_kernel_d64(
 
 }
 
+
+__global__ void tensorcore_attention_forward_kernel_d64_production(
+    const half* __restrict__ query,
+    const half* __restrict__ key,
+    const half* __restrict__ value,
+    half* __restrict__ output,
+    int64_t sequence_length,
+    float scale
+) {
+    const int thread_id =
+        static_cast<int>(threadIdx.x);
+
+    const int warp_id =
+        thread_id / kWarpSize;
+
+    const int lane_id =
+        thread_id % kWarpSize;
+
+    const int64_t batch_head_index =
+        static_cast<int64_t>(blockIdx.y);
+
+    const int64_t query_tile_start =
+        static_cast<int64_t>(blockIdx.x) *
+        kProductionBlockM;
+
+    const int64_t tensor_base =
+        batch_head_index *
+        sequence_length *
+        kHeadDimension;
+
+
+    /*
+     * Shared memory.
+     *
+     * Q keeps the known-good padded layout.
+     * K/V use compact 64-wide XOR-swizzled layouts.
+     */
+    constexpr int kProductionQuerySharedStride =
+        kHeadDimension + 8;
+
+    __shared__ __align__(32)
+    half query_shared[
+        kProductionBlockM
+    ][
+        kProductionQuerySharedStride
+    ];
+
+    __shared__ __align__(128)
+    half key_shared
+    [
+        kProductionBlockN
+    ][
+        kHeadDimension
+    ];
+
+    __shared__ __align__(128)
+    half value_shared[
+        kProductionBlockN
+    ][
+        kHeadDimension
+    ];
+
+
+    /*
+     * Two 16-row M slices per warp.
+     *
+     * warp 0:   0..15,  64..79
+     * warp 1:  16..31,  80..95
+     * warp 2:  32..47,  96..111
+     * warp 3:  48..63, 112..127
+     */
+    const int first_query_row =
+        warp_id * kMmaM;
+
+    const int second_query_row =
+        first_query_row +
+        kProductionWarpsPerBlock *
+            kMmaM;
+
+
+    /*
+     * Stage the 128 x 64 Q tile once.
+     *
+     * Q is reused across every K/V tile.
+     */
+    constexpr int kProductionQueryElements =
+        kProductionBlockM *
+        kHeadDimension;
+
+    for (
+        int element = thread_id;
+        element < kProductionQueryElements;
+        element += kProductionThreadsPerBlock
+    ) {
+        const int local_query_row =
+            element / kHeadDimension;
+
+        const int dimension =
+            element % kHeadDimension;
+
+        const int64_t global_query_row =
+            query_tile_start +
+            local_query_row;
+
+        if (
+            global_query_row <
+            sequence_length
+        ) {
+            const int64_t global_index =
+                tensor_base +
+                global_query_row *
+                    kHeadDimension +
+                dimension;
+
+            query_shared[
+                local_query_row
+            ][
+                dimension
+            ] = query[global_index];
+        } else {
+            query_shared[
+                local_query_row
+            ][
+                dimension
+            ] = __float2half_rn(0.0f);
+        }
+    }
+
+    __syncthreads();
+
+
+    /*
+     * MMA tile geometry.
+     */
+    constexpr int kProductionRawMmaOutputColumns =
+        8;
+
+    constexpr int kProductionComputeBlockN = 32;
+
+    constexpr int kProductionScoreSubtiles =
+        kProductionComputeBlockN /
+        kProductionRawMmaOutputColumns;   // 4
+
+    constexpr int kProductionOutputSubtiles =
+        kHeadDimension /
+        kProductionRawMmaOutputColumns;  // 8
+
+    constexpr int kProductionProbabilityFragments =
+        kProductionComputeBlockN /
+        kMmaK;                           // 2
+
+    static_assert(
+        kProductionScoreSubtiles ==
+        kProductionProbabilityFragments * 2
+    );
+
+
+    /*
+     * Persistent FP32 output numerators.
+     *
+     * These survive across every K/V tile.
+     */
+    float first_output_accumulator[32];
+    float second_output_accumulator[32];
+
+#pragma unroll
+    for (
+        int item = 0;
+        item < 32;
+        ++item
+    ) {
+        first_output_accumulator[item] =
+            0.0f;
+
+        second_output_accumulator[item] =
+            0.0f;
+    }
+
+
+    /*
+     * Independent online-softmax state for
+     * the two M slices owned by this warp.
+     *
+     * Lanes 0..15 own the row-level state.
+     */
+    float first_running_row_max =
+        -CUDART_INF_F;
+
+    float first_running_row_sum =
+        0.0f;
+
+    float second_running_row_max =
+        -CUDART_INF_F;
+
+    float second_running_row_sum =
+        0.0f;
+
+
+    /*
+     * MMA accumulator row ownership is invariant
+     * across output D subtiles.
+     */
+    const int upper_output_row =
+        lane_id >> 2;
+
+    const int lower_output_row =
+        upper_output_row + 8;
+
+
+    /*
+     * Stream through all K/V tiles.
+     *
+     * This is deliberately sequential for 9A:
+     *
+     * stage K/V
+     *   -> wait/barrier
+     *   -> QK
+     *   -> online softmax
+     *   -> PV
+     *   -> persistent O update
+     *   -> barrier
+     *
+     * Pipelining comes after correctness.
+     */
+    for (
+        int64_t key_tile_start = 0;
+        key_tile_start < sequence_length;
+        key_tile_start += kProductionBlockN
+    ) {
+
+        /*
+         * Stage current K/V tile.
+         */
+
+        stage_tile_async_16_swizzled_64<
+            kProductionBlockN
+        >(
+            &key_shared[0][0],
+            key,
+            key_tile_start,
+            tensor_base,
+            thread_id,
+            kProductionThreadsPerBlock
+        );
+
+        stage_tile_async_16_swizzled_64<
+            kProductionBlockN
+        >(
+            &value_shared[0][0],
+            value,
+            key_tile_start,
+            tensor_base,
+            thread_id,
+            kProductionThreadsPerBlock
+        );
+
+        commit_async_copy_group();
+        wait_for_async_copy_group();
+
+        __syncthreads();    
+
+
+        #pragma unroll 1
+        for(int key_chunk_offset = 0; key_chunk_offset < kProductionBlockN; key_chunk_offset += kProductionComputeBlockN){
+            /*
+            * Fresh QK score state for this K tile.
+            */
+            MmaAccumulator
+                first_score_accumulators[
+                    kProductionScoreSubtiles
+                ];
+
+            MmaAccumulator
+                second_score_accumulators[
+                    kProductionScoreSubtiles
+                ];
+
+    #pragma unroll
+            for (
+                int score_subtile = 0;
+                score_subtile <
+                    kProductionScoreSubtiles;
+                ++score_subtile
+            ) {
+                first_score_accumulators[
+                    score_subtile
+                ] = zero_mma_accumulator();
+
+                second_score_accumulators[
+                    score_subtile
+                ] = zero_mma_accumulator();
+            }
+
+
+            /*
+            * QK^T.
+            *
+            * One K fragment is reused by both
+            * M slices owned by the warp.
+            */
+    #pragma unroll
+            for (
+                int dimension_offset = 0;
+                dimension_offset <
+                    kHeadDimension;
+                dimension_offset += kMmaK
+            ) {
+                const half* first_query_tile =
+                    &query_shared[
+                        first_query_row
+                    ][
+                        dimension_offset
+                    ];
+
+                const half* second_query_tile =
+                    &query_shared[
+                        second_query_row
+                    ][
+                        dimension_offset
+                    ];
+
+                const MmaOperandA
+                    first_query_fragment =
+                        load_mma_a_row_major(
+                            first_query_tile,
+                            kProductionQuerySharedStride
+                        );
+
+                const MmaOperandA
+                    second_query_fragment =
+                        load_mma_a_row_major(
+                            second_query_tile,
+                            kProductionQuerySharedStride
+                        );
+
+    #pragma unroll
+                for (
+                    int score_subtile = 0;
+                    score_subtile <
+                        kProductionScoreSubtiles;
+                    ++score_subtile
+                ) {
+                    const int key_offset =
+                        key_chunk_offset +
+                        score_subtile *
+                            kProductionRawMmaOutputColumns;
+
+                    const MmaOperandB key_fragment =
+                        load_mma_b_k_transpose_from_swizzled_row_major(
+                            &key_shared[0][0],
+                            key_offset,
+                            dimension_offset
+                        );
+
+                    mma_m16n8k16_f16_f32(
+                        first_score_accumulators[
+                            score_subtile
+                        ],
+                        first_query_fragment,
+                        key_fragment
+                    );
+
+                    mma_m16n8k16_f16_f32(
+                        second_score_accumulators[
+                            score_subtile
+                        ],
+                        second_query_fragment,
+                        key_fragment
+                    );
+                }
+            }
+
+
+            /*
+            * Independent online softmax for the
+            * two M slices.
+            *
+            * Scores are converted directly into
+            * P MMA operands.
+            */
+            MmaOperandA first_probability_fragments[kProductionProbabilityFragments];
+            MmaOperandA second_probability_fragments[kProductionProbabilityFragments];
+
+            float first_previous_scale_for_lane =
+                0.0f;
+
+            float second_previous_scale_for_lane =
+                0.0f;
+
+            normalize_score_tile_and_make_probability<
+                kProductionScoreSubtiles
+            >(
+                first_score_accumulators,
+                scale,
+                lane_id,
+                first_running_row_max,
+                first_running_row_sum,
+                first_probability_fragments,
+                first_previous_scale_for_lane
+            );
+
+            normalize_score_tile_and_make_probability<
+                kProductionScoreSubtiles
+            >(
+                second_score_accumulators,
+                scale,
+                lane_id,
+                second_running_row_max,
+                second_running_row_sum,
+                second_probability_fragments,
+                second_previous_scale_for_lane
+            );
+
+            
+
+
+            /*
+            * Broadcast each row's old-output rescale
+            * factor to the lanes that own that row's
+            * PV accumulator registers.
+            */
+            const float
+                first_upper_previous_scale =
+                    __shfl_sync(
+                        kFullWarpMask,
+                        first_previous_scale_for_lane,
+                        upper_output_row
+                    );
+
+            const float
+                first_lower_previous_scale =
+                    __shfl_sync(
+                        kFullWarpMask,
+                        first_previous_scale_for_lane,
+                        lower_output_row
+                    );
+
+            const float
+                second_upper_previous_scale =
+                    __shfl_sync(
+                        kFullWarpMask,
+                        second_previous_scale_for_lane,
+                        upper_output_row
+                    );
+
+            const float
+                second_lower_previous_scale =
+                    __shfl_sync(
+                        kFullWarpMask,
+                        second_previous_scale_for_lane,
+                        lower_output_row
+                    );
+
+
+            /*
+            * PV.
+            *
+            * One V fragment is reused by both
+            * independent M slices.
+            */
+    #pragma unroll
+            for (
+                int output_subtile = 0;
+                output_subtile <
+                    kProductionOutputSubtiles;
+                ++output_subtile
+            ) {
+                const int
+                    output_dimension_offset =
+                        output_subtile *
+                        kProductionRawMmaOutputColumns;
+
+                MmaAccumulator
+                    first_pv_accumulator =
+                        zero_mma_accumulator();
+
+                MmaAccumulator
+                    second_pv_accumulator =
+                        zero_mma_accumulator();
+
+
+    #pragma unroll
+                for (
+                    int reduction_subtile = 0;
+                    reduction_subtile < kProductionProbabilityFragments;
+                    ++reduction_subtile
+                ) {
+                    const int reduction_offset =
+                        key_chunk_offset +
+                        reduction_subtile *
+                            kMmaK;
+
+                    const MmaOperandB
+                        value_fragment =
+                            load_mma_b_col_major_from_swizzled_value(
+                                &value_shared[0][0],
+                                reduction_offset,
+                                output_dimension_offset
+                            );
+
+                    mma_m16n8k16_f16_f32(
+                        first_pv_accumulator,
+                        first_probability_fragments[
+                            reduction_subtile
+                        ],
+                        value_fragment
+                    );
+
+                    mma_m16n8k16_f16_f32(
+                        second_pv_accumulator,
+                        second_probability_fragments[
+                            reduction_subtile
+                        ],
+                        value_fragment
+                    );
+                }
+
+
+                /*
+                * Merge this tile's PV contribution into
+                * the persistent online numerator.
+                */
+    #pragma unroll
+                for (
+                    int register_index = 0;
+                    register_index < 4;
+                    ++register_index
+                ) {
+                    const int accumulator_index =
+                        output_subtile * 4 +
+                        register_index;
+
+                    const bool is_upper_row =
+                        register_index < 2;
+
+                    const float first_previous_scale =
+                        is_upper_row
+                            ? first_upper_previous_scale
+                            : first_lower_previous_scale;
+
+                    const float second_previous_scale =
+                        is_upper_row
+                            ? second_upper_previous_scale
+                            : second_lower_previous_scale;
+
+                    first_output_accumulator[
+                        accumulator_index
+                    ] =
+                        first_previous_scale *
+                            first_output_accumulator[
+                                accumulator_index
+                            ] +
+                        first_pv_accumulator.registers[
+                            register_index
+                        ];
+
+                    second_output_accumulator[
+                        accumulator_index
+                    ] =
+                        second_previous_scale *
+                            second_output_accumulator[
+                                accumulator_index
+                            ] +
+                        second_pv_accumulator.registers[
+                            register_index
+                        ];
+                }
+            }
+
+        }
+
+
+        /*
+         * All warps must finish consuming the current
+         * K/V tile before shared memory is overwritten
+         * by the next iteration.
+         */
+        __syncthreads();
+    }
+
+
+    /*
+     * Final softmax normalization.
+     */
+    const float first_upper_inverse_sum =
+        1.0f /
+        __shfl_sync(
+            kFullWarpMask,
+            first_running_row_sum,
+            upper_output_row
+        );
+
+    const float first_lower_inverse_sum =
+        1.0f /
+        __shfl_sync(
+            kFullWarpMask,
+            first_running_row_sum,
+            lower_output_row
+        );
+
+    const float second_upper_inverse_sum =
+        1.0f /
+        __shfl_sync(
+            kFullWarpMask,
+            second_running_row_sum,
+            upper_output_row
+        );
+
+    const float second_lower_inverse_sum =
+        1.0f /
+        __shfl_sync(
+            kFullWarpMask,
+            second_running_row_sum,
+            lower_output_row
+        );
+
+
+    /*
+     * FP32 -> FP16 half2 epilogue.
+     *
+     * Write both M slices owned by the warp.
+     */
+#pragma unroll
+    for (
+        int output_subtile = 0;
+        output_subtile <
+            kProductionOutputSubtiles;
+        ++output_subtile
+    ) {
+
+#pragma unroll
+        for (
+            int register_pair = 0;
+            register_pair < 2;
+            ++register_pair
+        ) {
+            const int register_index =
+                register_pair * 2;
+
+            const int local_row =
+                mma_accumulator_row(
+                    lane_id,
+                    register_index
+                );
+
+            const int dimension =
+                output_subtile *
+                    kProductionRawMmaOutputColumns +
+                mma_accumulator_column(
+                    lane_id,
+                    register_index
+                );
+
+            const int accumulator_index =
+                output_subtile * 4 +
+                register_index;
+
+            const bool is_upper_row =
+                register_index < 2;
+
+            const float first_inverse_sum =
+                is_upper_row
+                    ? first_upper_inverse_sum
+                    : first_lower_inverse_sum;
+
+            const float second_inverse_sum =
+                is_upper_row
+                    ? second_upper_inverse_sum
+                    : second_lower_inverse_sum;
+
+
+            /*
+             * First M slice.
+             */
+            const int64_t
+                first_global_query_row =
+                    query_tile_start +
+                    first_query_row +
+                    local_row;
+
+            if (
+                first_global_query_row <
+                sequence_length
+            ) {
+                const float first_value =
+                    first_output_accumulator[
+                        accumulator_index
+                    ] *
+                    first_inverse_sum;
+
+                const float second_value =
+                    first_output_accumulator[
+                        accumulator_index + 1
+                    ] *
+                    first_inverse_sum;
+
+                const half2 packed_output =
+                    __floats2half2_rn(
+                        first_value,
+                        second_value
+                    );
+
+                const int64_t global_index =
+                    tensor_base +
+                    first_global_query_row *
+                        kHeadDimension +
+                    dimension;
+
+                *reinterpret_cast<half2*>(
+                    &output[global_index]
+                ) = packed_output;
+            }
+
+
+            /*
+             * Second M slice.
+             */
+            const int64_t
+                second_global_query_row =
+                    query_tile_start +
+                    second_query_row +
+                    local_row;
+
+            if (
+                second_global_query_row <
+                sequence_length
+            ) {
+                const float first_value =
+                    second_output_accumulator[
+                        accumulator_index
+                    ] *
+                    second_inverse_sum;
+
+                const float second_value =
+                    second_output_accumulator[
+                        accumulator_index + 1
+                    ] *
+                    second_inverse_sum;
+
+                const half2 packed_output =
+                    __floats2half2_rn(
+                        first_value,
+                        second_value
+                    );
+
+                const int64_t global_index =
+                    tensor_base +
+                    second_global_query_row *
+                        kHeadDimension +
+                    dimension;
+
+                *reinterpret_cast<half2*>(
+                    &output[global_index]
+                ) = packed_output;
+            }
+        }
+    }
+}
 
 template <int kKeyTileSize>
 void validate_tensorcore_attention_inputs(
@@ -1771,6 +2945,144 @@ torch::Tensor tensorcore_attention_forward_impl(
     return output;
 }
 
+torch::Tensor tensorcore_attention_forward_production_impl(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value
+) {
+    /*
+     * 9A uses BlockN = 32, so K/V currently require
+     * sequence length divisible by 32.
+     */
+    validate_tensorcore_attention_inputs<
+        kProductionBlockN
+    >(
+        query,
+        key,
+        value
+    );
+
+    const c10::cuda::CUDAGuard device_guard(
+        query.device()
+    );
+
+    torch::Tensor output =
+        torch::empty_like(query);
+
+    const int64_t batch_size =
+        query.size(0);
+
+    const int64_t num_heads =
+        query.size(1);
+
+    const int64_t sequence_length =
+        query.size(2);
+
+    if (
+        batch_size == 0 ||
+        num_heads == 0 ||
+        sequence_length == 0
+    ) {
+        return output;
+    }
+
+    /*
+     * Production 9A processes 128 query rows / CTA.
+     */
+    const int64_t num_query_tiles =
+        (
+            sequence_length +
+            kProductionBlockM -
+            1
+        ) /
+        kProductionBlockM;
+
+    const int64_t num_batch_heads =
+        batch_size * num_heads;
+
+    TORCH_CHECK(
+        num_query_tiles <=
+            static_cast<int64_t>(
+                std::numeric_limits<
+                    unsigned int
+                >::max()
+            ),
+        "too many query tiles for CUDA grid.x"
+    );
+
+    TORCH_CHECK(
+        num_batch_heads <= 65535,
+        "batch * heads exceeds CUDA grid.y limit"
+    );
+
+    const float scale =
+        1.0f /
+        std::sqrt(
+            static_cast<float>(
+                kHeadDimension
+            )
+        );
+
+    const dim3 grid(
+        static_cast<unsigned int>(
+            num_query_tiles
+        ),
+        static_cast<unsigned int>(
+            num_batch_heads
+        ),
+        1
+    );
+
+    const dim3 block(
+        kProductionThreadsPerBlock,
+        1,
+        1
+    );
+
+    const half* query_ptr =
+        reinterpret_cast<const half*>(
+            query.data_ptr<at::Half>()
+        );
+
+    const half* key_ptr =
+        reinterpret_cast<const half*>(
+            key.data_ptr<at::Half>()
+        );
+
+    const half* value_ptr =
+        reinterpret_cast<const half*>(
+            value.data_ptr<at::Half>()
+        );
+
+    half* output_ptr =
+        reinterpret_cast<half*>(
+            output.data_ptr<at::Half>()
+        );
+
+    cudaStream_t stream =
+        at::cuda::getCurrentCUDAStream(
+            query.get_device()
+        );
+
+    tensorcore_attention_forward_kernel_d64_production<<<
+        grid,
+        block,
+        0,
+        stream
+    >>>(
+        query_ptr,
+        key_ptr,
+        value_ptr,
+        output_ptr,
+        sequence_length,
+        scale
+    );
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return output;
+}
+
 }  // namespace
 
 
@@ -1831,6 +3143,18 @@ torch::Tensor tensorcore_attention_forward_bc32_raw_qk_raw_pv(
         true,
         true
     >(
+        query,
+        key,
+        value
+    );
+}
+
+torch::Tensor tensorcore_attention_forward_production_128x64(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value
+) {
+    return tensorcore_attention_forward_production_impl(
         query,
         key,
         value
